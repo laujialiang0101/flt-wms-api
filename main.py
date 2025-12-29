@@ -307,7 +307,7 @@ async def get_movement_analysis(
                 WITH daily_sales AS (
                     SELECT
                         d."AcStockID" as stock_id,
-                        SUM(d."Quantity") as qty_sold
+                        SUM(d."ItemQuantity") as qty_sold
                     FROM "AcCSD" d
                     INNER JOIN "AcCSM" m ON d."DocumentNo" = m."DocumentNo"
                     WHERE m."AcLocationID" = $1
@@ -371,7 +371,7 @@ async def get_stock_days_analysis(
                     SELECT
                         m."AcLocationID" as location_id,
                         SUM(d."ItemTotal") as total_sales,
-                        SUM(d."ItemCost" * d."Quantity") as total_cogs
+                        SUM(d."ItemCost" * d."ItemQuantity") as total_cogs
                     FROM "AcCSD" d
                     INNER JOIN "AcCSM" m ON d."DocumentNo" = m."DocumentNo"
                     WHERE m."DocumentDate"::date >= $1
@@ -404,7 +404,7 @@ async def get_stock_days_analysis(
             # Calculate company total
             totals = await conn.fetchrow("""
                 WITH period_cogs AS (
-                    SELECT SUM(d."ItemCost" * d."Quantity") as total_cogs
+                    SELECT SUM(d."ItemCost" * d."ItemQuantity") as total_cogs
                     FROM "AcCSD" d
                     INNER JOIN "AcCSM" m ON d."DocumentNo" = m."DocumentNo"
                     WHERE m."DocumentDate"::date >= $1
