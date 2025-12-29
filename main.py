@@ -264,7 +264,7 @@ async def get_stock_balance_summary(
                         l."AcLocationDesc" as location_name,
                         COUNT(DISTINCT b."AcStockID") as sku_count,
                         SUM(COALESCE(b."BalanceQuantity", 0)) as total_qty,
-                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."ItemCost", 0)) as total_value
+                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."StockCost", 0)) as total_value
                     FROM "AcStockBalanceLocation" b
                     LEFT JOIN "AcLocation" l ON b."AcLocationID" = l."AcLocationID"
                     LEFT JOIN "AcStockCompany" s ON b."AcStockID" = s."AcStockID" AND b."AcStockUOMID" = s."AcStockUOMID"
@@ -278,7 +278,7 @@ async def get_stock_balance_summary(
                         l."AcLocationDesc" as location_name,
                         COUNT(DISTINCT b."AcStockID") as sku_count,
                         SUM(COALESCE(b."BalanceQuantity", 0)) as total_qty,
-                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."ItemCost", 0)) as total_value
+                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."StockCost", 0)) as total_value
                     FROM "AcStockBalanceLocation" b
                     LEFT JOIN "AcLocation" l ON b."AcLocationID" = l."AcLocationID"
                     LEFT JOIN "AcStockCompany" s ON b."AcStockID" = s."AcStockID" AND b."AcStockUOMID" = s."AcStockUOMID"
@@ -382,7 +382,7 @@ async def get_stock_days_analysis(
                 current_stock AS (
                     SELECT
                         b."AcLocationID" as location_id,
-                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."ItemCost", 0)) as stock_value
+                        SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."StockCost", 0)) as stock_value
                     FROM "AcStockBalanceLocation" b
                     LEFT JOIN "AcStockCompany" s ON b."AcStockID" = s."AcStockID" AND b."AcStockUOMID" = s."AcStockUOMID"
                     GROUP BY b."AcLocationID"
@@ -413,7 +413,7 @@ async def get_stock_days_analysis(
                     WHERE m."DocumentDate"::date >= $1
                 ),
                 total_stock AS (
-                    SELECT SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."ItemCost", 0)) as stock_value
+                    SELECT SUM(COALESCE(b."BalanceQuantity", 0) * COALESCE(s."StockCost", 0)) as stock_value
                     FROM "AcStockBalanceLocation" b
                     LEFT JOIN "AcStockCompany" s ON b."AcStockID" = s."AcStockID" AND b."AcStockUOMID" = s."AcStockUOMID"
                 )
