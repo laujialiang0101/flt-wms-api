@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
 
-# Database configuration (same as KPI Tracker)
+# Database configuration (same as KPI Tracker - external hostname)
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'dpg-d4pr99je5dus73eb5730-a.singapore-postgres.render.com'),
     'port': int(os.getenv('DB_PORT', 5432)),
