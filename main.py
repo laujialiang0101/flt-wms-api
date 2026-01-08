@@ -11,11 +11,13 @@ Features planned:
 """
 
 import os
-import json
+import secrets
+import hashlib
 import asyncio
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
+from pydantic import BaseModel
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,30 +25,116 @@ import asyncpg
 
 from expiry_endpoints import create_expiry_router
 
-# Load config from sync_config.json (same as sync service)
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), '..', 'sync_config.json')
-with open(CONFIG_PATH, 'r') as f:
-    config = json.load(f)
-    pg_config = config['connections']['postgres']
+# Optional bcrypt for password hashing (same as KPI tracker)
+try:
+    import bcrypt
+    BCRYPT_AVAILABLE = True
+except ImportError:
+    BCRYPT_AVAILABLE = False
+    print("Warning: bcrypt not installed. Using hashlib fallback.")
 
-# Database configuration (same as KPI Tracker - external hostname)
-DB_CONFIG = {
-    'host': os.getenv('DB_HOST', pg_config['host']),
-    'port': int(os.getenv('DB_PORT', pg_config['port'])),
-    'database': os.getenv('DB_NAME', pg_config['database']),
-    'user': os.getenv('DB_USER', pg_config['user']),
-    'password': os.getenv('DB_PASSWORD', pg_config['password']),
-    'ssl': 'require'
-}
+# Database configuration (same as KPI Tracker)
+# Internal hostname = short hostname - faster within Render private network
+# External hostname = full domain with -a suffix - works from anywhere
+INTERNAL_HOST = 'dpg-d4pr99je5dus73eb5730-a'
+EXTERNAL_HOST = 'dpg-d4pr99je5dus73eb5730-a.singapore-postgres.render.com'
+DB_PORT = int(os.getenv('DB_PORT', 5432))
+DB_NAME = os.getenv('DB_NAME', 'flt_sales_commission_db')
+DB_USER = os.getenv('DB_USER', 'flt_sales_commission_db_user')
+DB_PASSWORD = os.getenv('DB_PASSWORD', 'Wy0ZP1wjLPsIta0YLpYLeRWgdITbya2m')
 
 pool: asyncpg.Pool = None
+connected_host: str = None
+
+
+async def init_connection(conn):
+    """Initialize each connection with MYT timezone."""
+    await conn.execute("SET timezone TO 'Asia/Kuala_Lumpur'")
+
+
+async def create_pool_with_retry():
+    """Create connection pool - try internal first (faster), then external."""
+    global connected_host
+
+    # Try internal first (faster, private network)
+    print(f"Trying INTERNAL host: {INTERNAL_HOST}", flush=True)
+    for attempt in range(2):
+        try:
+            created_pool = await asyncpg.create_pool(
+                host=INTERNAL_HOST,
+                port=DB_PORT,
+                database=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                ssl=False,
+                min_size=1,
+                max_size=10,
+                command_timeout=60,
+                init=init_connection,
+            )
+            async with created_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            print(f"SUCCESS with internal host!", flush=True)
+            connected_host = INTERNAL_HOST
+            return created_pool
+        except Exception as e:
+            print(f"  Failed: {e}", flush=True)
+            if attempt < 1:
+                await asyncio.sleep(1)
+
+    # Fallback to external
+    print(f"Trying EXTERNAL host: {EXTERNAL_HOST}", flush=True)
+    for attempt in range(3):
+        try:
+            created_pool = await asyncpg.create_pool(
+                host=EXTERNAL_HOST,
+                port=DB_PORT,
+                database=DB_NAME,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                ssl='require',
+                min_size=1,
+                max_size=10,
+                command_timeout=60,
+                init=init_connection,
+            )
+            async with created_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            print(f"SUCCESS with external host!", flush=True)
+            connected_host = EXTERNAL_HOST
+            return created_pool
+        except Exception as e:
+            print(f"  Failed: {e}", flush=True)
+            if attempt < 2:
+                await asyncio.sleep(2)
+
+    raise Exception("All connection attempts failed")
+
+
+# Password hashing utilities (same as KPI tracker)
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a password against its hash."""
+    if BCRYPT_AVAILABLE and not password_hash.startswith('sha256$'):
+        try:
+            return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+        except:
+            return False
+    elif password_hash.startswith('sha256$'):
+        parts = password_hash.split('$')
+        if len(parts) != 3:
+            return False
+        salt = parts[1]
+        stored_hash = parts[2]
+        computed_hash = hashlib.sha256((salt + password).encode()).hexdigest()
+        return computed_hash == stored_hash
+    return False
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage database connection pool lifecycle."""
     global pool
-    pool = await asyncpg.create_pool(**DB_CONFIG, min_size=2, max_size=10)
+    pool = await create_pool_with_retry()
     print("Database pool created")
     yield
     if pool:
@@ -105,35 +193,34 @@ async def health_check():
 
 
 # ============================================================================
-# Authentication (using kpi.staff_list_master)
+# Authentication (using kpi.staff_list_master + kpi_user_auth)
+# Same method as KPI Tracker - Staff ID + Password
 # ============================================================================
 
+class LoginRequest(BaseModel):
+    staff_id: str
+    password: str
+
+
 @app.post("/api/v1/auth/login")
-async def login(staff_id: str = Query(..., description="Staff ID (IC number)"),
-                phone: str = Query(..., description="Phone number for verification")):
+async def login(request: LoginRequest):
     """
-    Authenticate staff using staff_list_master table.
+    Authenticate staff using staff_list_master + kpi_user_auth tables.
+    Same authentication method as KPI Tracker.
     Only administrators can access the WMS app.
     """
     try:
         async with pool.acquire() as conn:
-            # Find staff by ID and verify phone
+            # Find staff by ID
             staff = await conn.fetchrow("""
-                SELECT staff_id, staff_name, role, phone, is_active,
+                SELECT staff_id, staff_name, role, is_active,
                        primary_outlet, primary_outlet_name
                 FROM kpi.staff_list_master
-                WHERE staff_id = $1 AND is_active = true
-            """, staff_id)
+                WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
+            """, request.staff_id)
 
             if not staff:
                 raise HTTPException(status_code=401, detail="Staff ID not found or inactive")
-
-            # Verify phone (remove spaces and dashes for comparison)
-            stored_phone = (staff['phone'] or '').replace(' ', '').replace('-', '')
-            input_phone = phone.replace(' ', '').replace('-', '')
-
-            if stored_phone != input_phone:
-                raise HTTPException(status_code=401, detail="Invalid phone number")
 
             # Check if admin role
             if staff['role'].lower() != 'admin':
@@ -141,6 +228,22 @@ async def login(staff_id: str = Query(..., description="Staff ID (IC number)"),
                     status_code=403,
                     detail=f"Access denied. Only administrators can access WMS. Your role: {staff['role']}"
                 )
+
+            # Verify password from kpi_user_auth (same table as KPI Tracker)
+            kpi_auth = await conn.fetchrow("""
+                SELECT password_hash FROM kpi_user_auth WHERE UPPER(code) = UPPER($1)
+            """, request.staff_id)
+
+            if not kpi_auth:
+                # First-time login - user needs to set password in KPI Tracker first
+                raise HTTPException(
+                    status_code=401,
+                    detail="Password not set. Please login to KPI Tracker first to set your password."
+                )
+
+            # Verify password
+            if not verify_password(request.password, kpi_auth['password_hash']):
+                raise HTTPException(status_code=401, detail="Invalid password")
 
             return {
                 "success": True,
