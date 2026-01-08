@@ -3590,7 +3590,9 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
                 }
             }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        error_detail = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+        raise HTTPException(status_code=500, detail=error_detail)
 
 
 # ============================================================================
