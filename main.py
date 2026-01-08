@@ -3602,6 +3602,264 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================================
+# ANALYTICS VIEWS - Built on Existing AcStockBalanceDetail
+# ============================================================================
+# Uses existing AcStockBalanceDetail (25M rows, already synced) as source.
+# Creates views for analytics without duplicating data.
+# Enhances wms.stock_movement_summary with monthly columns.
+# ============================================================================
+
+@app.post("/api/v1/analytics/setup")
+async def setup_analytics(api_key: str = Query(...)):
+    """
+    Create analytics views on existing AcStockBalanceDetail.
+    Add monthly columns to wms.stock_movement_summary.
+
+    No data duplication - uses existing synced tables.
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Create schema
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS analytics")
+
+            # Add monthly columns to existing wms.stock_movement_summary
+            await conn.execute("""
+                DO $$
+                BEGIN
+                    -- Monthly movement columns (last 12 months)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='qty_m1') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m1 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m2 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m3 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m4 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m5 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m6 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m7 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m8 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m9 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m10 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m11 NUMERIC DEFAULT 0;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN qty_m12 NUMERIC DEFAULT 0;
+                    END IF;
+                    -- 3-Month Average Monthly Sellout (AMS)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='ams_3m') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN ams_3m NUMERIC DEFAULT 0;
+                    END IF;
+                    -- Seasonality classification
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='seasonality_type') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN seasonality_type VARCHAR(30) DEFAULT 'UNKNOWN';
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN seasonal_peak_trough_ratio NUMERIC;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN peak_months VARCHAR(30);
+                    END IF;
+                    -- Velocity category
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='velocity_category') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN velocity_category VARCHAR(20) DEFAULT 'UNKNOWN';
+                    END IF;
+                    -- Lead time category
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='lead_time_category') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN lead_time_category VARCHAR(20) DEFAULT 'STANDARD';
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN lead_time_days INTEGER DEFAULT 14;
+                    END IF;
+                    -- Smart reorder recommendation
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='reorder_recommendation') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN reorder_recommendation VARCHAR(30) DEFAULT 'UNKNOWN';
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN target_doi INTEGER;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN reorder_point NUMERIC;
+                    END IF;
+                    -- Trend vs AMS
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='trend_7d_vs_ams') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN trend_7d_vs_ams NUMERIC;
+                    END IF;
+                    -- UOM descriptions
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='base_uom_desc') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN base_uom_desc VARCHAR(50);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN order_uom_desc VARCHAR(50);
+                    END IF;
+                END $$;
+            """)
+
+            # Create indexes on wms.stock_movement_summary for new columns
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_wms_seasonality ON wms.stock_movement_summary(seasonality_type)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_wms_velocity ON wms.stock_movement_summary(velocity_category)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_wms_recommendation ON wms.stock_movement_summary(reorder_recommendation)")
+
+            # Create view on AcStockBalanceDetail for monthly sales analysis
+            await conn.execute("""
+                CREATE OR REPLACE VIEW analytics.v_monthly_sales AS
+                SELECT
+                    sbd."AcStockID" as stock_id,
+                    sbd."AcStockUOMID" as stock_uom_id,
+                    DATE_TRUNC('month', sbd."DocumentDate")::date as sale_month,
+                    SUM(sbd."QuantityOut") as total_quantity,
+                    SUM(sbd."QuantityOut" * sbd."ItemUnitPrice") as total_revenue,
+                    COUNT(DISTINCT sbd."AcLocationID") as outlets_sold
+                FROM "AcStockBalanceDetail" sbd
+                WHERE sbd."DocumentType" IN ('CUS_CASH_SALES', 'CUS_INVOICE')
+                  AND sbd."DocumentDate" >= CURRENT_DATE - INTERVAL '24 months'
+                GROUP BY sbd."AcStockID", sbd."AcStockUOMID", DATE_TRUNC('month', sbd."DocumentDate")
+            """)
+
+            # Create view for SKU intelligence from wms.stock_movement_summary
+            await conn.execute("""
+                CREATE OR REPLACE VIEW analytics.v_sku_intelligence AS
+                SELECT
+                    stock_id,
+                    stock_name,
+                    barcode,
+                    category,
+                    brand,
+                    ud1_code,
+                    abc_class,
+                    xyz_class,
+                    abc_xyz_class,
+                    cv_value,
+                    gp_margin_pct as margin_pct,
+                    CASE
+                        WHEN gp_margin_pct < 15 THEN 'LOW_MARGIN'
+                        WHEN gp_margin_pct < 30 THEN 'MEDIUM_MARGIN'
+                        WHEN gp_margin_pct < 45 THEN 'GOOD_MARGIN'
+                        ELSE 'HIGH_MARGIN'
+                    END as margin_category,
+                    revenue_last_365d as l12m_revenue,
+                    qty_last_365d as l12m_quantity,
+                    gp_last_365d as l12m_gross_profit,
+                    revenue_last_90d as l3m_revenue,
+                    qty_last_90d as l3m_quantity,
+                    avg_daily_30d,
+                    current_balance as current_stock_qty,
+                    days_of_inventory as days_of_stock,
+                    stockout_risk as stock_status,
+                    trend_status as sales_trend,
+                    trend_7d_vs_30d as trend_pct,
+                    ams_3m,
+                    seasonality_type,
+                    velocity_category,
+                    lead_time_category,
+                    reorder_recommendation as recommended_action,
+                    CASE WHEN ud1_code = 'FLTHB' THEN TRUE ELSE FALSE END as is_house_brand,
+                    last_updated
+                FROM wms.stock_movement_summary
+            """)
+
+            return {
+                "status": "success",
+                "message": "Analytics setup complete - columns added to wms.stock_movement_summary, views created",
+                "columns_added": ["qty_m1-m12", "ams_3m", "seasonality_type", "velocity_category", "lead_time_category", "reorder_recommendation"],
+                "views_created": ["analytics.v_monthly_sales", "analytics.v_sku_intelligence"]
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/analytics/sku-intelligence")
+async def get_sku_intelligence(
+    api_key: str = Query(...),
+    abc_class: Optional[str] = Query(default=None, description="Filter by ABC class: A, B, C"),
+    xyz_class: Optional[str] = Query(default=None, description="Filter by XYZ class: X, Y, Z"),
+    margin_category: Optional[str] = Query(default=None, description="LOW_MARGIN, MEDIUM_MARGIN, GOOD_MARGIN, HIGH_MARGIN"),
+    stock_status: Optional[str] = Query(default=None, description="STOCKOUT, LOW, OK, OVERSTOCKED"),
+    seasonality: Optional[str] = Query(default=None, description="HIGHLY_SEASONAL, MODERATELY_SEASONAL, STABLE, DEAD"),
+    ud1_code: Optional[str] = Query(default=None, description="Filter by UD1 (e.g., FLTHB for House Brand)"),
+    search: Optional[str] = Query(default=None, description="Search by stock code or name"),
+    limit: int = Query(default=100, le=1000),
+    offset: int = Query(default=0)
+):
+    """Query SKU intelligence from wms.stock_movement_summary."""
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Build WHERE clause
+            conditions = []
+            params = []
+            param_idx = 1
+
+            if abc_class:
+                conditions.append(f"abc_class = ${param_idx}")
+                params.append(abc_class)
+                param_idx += 1
+
+            if xyz_class:
+                conditions.append(f"xyz_class = ${param_idx}")
+                params.append(xyz_class)
+                param_idx += 1
+
+            if margin_category:
+                margin_ranges = {
+                    'LOW_MARGIN': (0, 15),
+                    'MEDIUM_MARGIN': (15, 30),
+                    'GOOD_MARGIN': (30, 45),
+                    'HIGH_MARGIN': (45, 100)
+                }
+                if margin_category in margin_ranges:
+                    low, high = margin_ranges[margin_category]
+                    conditions.append(f"gp_margin_pct >= ${param_idx} AND gp_margin_pct < ${param_idx + 1}")
+                    params.extend([low, high])
+                    param_idx += 2
+
+            if stock_status:
+                conditions.append(f"stockout_risk = ${param_idx}")
+                params.append(stock_status)
+                param_idx += 1
+
+            if seasonality:
+                conditions.append(f"seasonality_type = ${param_idx}")
+                params.append(seasonality)
+                param_idx += 1
+
+            if ud1_code:
+                conditions.append(f"ud1_code = ${param_idx}")
+                params.append(ud1_code)
+                param_idx += 1
+
+            if search:
+                conditions.append(f"(stock_id ILIKE ${param_idx} OR stock_name ILIKE ${param_idx} OR barcode ILIKE ${param_idx})")
+                params.append(f"%{search}%")
+                param_idx += 1
+
+            where_clause = " AND ".join(conditions) if conditions else "TRUE"
+
+            # Add limit and offset
+            params.extend([limit, offset])
+
+            query = f"""
+                SELECT
+                    stock_id, stock_name, barcode, category, brand, ud1_code,
+                    abc_class, xyz_class, abc_xyz_class, cv_value,
+                    gp_margin_pct, revenue_last_365d, qty_last_365d, gp_last_365d,
+                    revenue_last_90d, qty_last_90d, avg_daily_30d,
+                    current_balance, days_of_inventory, stockout_risk,
+                    trend_status, trend_7d_vs_30d,
+                    ams_3m, seasonality_type, velocity_category,
+                    lead_time_category, reorder_recommendation,
+                    last_updated
+                FROM wms.stock_movement_summary
+                WHERE {where_clause}
+                ORDER BY revenue_last_365d DESC NULLS LAST
+                LIMIT ${param_idx} OFFSET ${param_idx + 1}
+            """
+
+            rows = await conn.fetch(query, *params)
+
+            # Get total count
+            count_query = f"SELECT COUNT(*) FROM wms.stock_movement_summary WHERE {where_clause}"
+            total = await conn.fetchval(count_query, *params[:-2]) if params[:-2] else await conn.fetchval("SELECT COUNT(*) FROM wms.stock_movement_summary")
+
+            return {
+                "status": "success",
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+                "data": [dict(row) for row in rows]
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8002)
