@@ -3373,7 +3373,7 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
                         DATE_TRUNC('month', m."DocumentDate") as sale_month,
                         SUM(d."ItemQuantity") as qty
                     FROM "AcCusInvoiceD" d
-                    INNER JOIN "AcCusInvoiceM" m ON d."DocumentNo" = m."DocumentNo"
+                    INNER JOIN "AcCusInvoiceM" m ON d."AcCusInvoiceMID" = m."AcCusInvoiceMID"
                     WHERE m."DocumentDate" >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '12 months'
                     GROUP BY d."AcStockID", DATE_TRUNC('month', m."DocumentDate")
                 ),
