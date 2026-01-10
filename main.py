@@ -3324,7 +3324,7 @@ async def view_stock_movement(
                        base_uom, base_uom_desc, order_uom, order_uom_desc, order_uom_rate, balance_in_order_uom,
                        current_balance, days_of_inventory, stockout_risk,
                        suggested_reorder_qty, reorder_point, target_doi,
-                       revenue_last_30d, therapeutic_group, product_family,
+                       revenue_last_30d, therapeutic_group,
                        ams_3m, velocity_category, lead_time_category, lead_time_days,
                        seasonality_type, seasonal_peak_trough_ratio, peak_months,
                        reorder_recommendation,
