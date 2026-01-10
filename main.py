@@ -3035,43 +3035,49 @@ async def refresh_stock_movement(api_key: str = Query(...)):
             steps_completed.append("drop_temp")
 
             # Create aggregated sales temp table (single pass through AcCSD)
+            # IMPORTANT: Convert all quantities to BASE UOM by multiplying with StockUOMRate
+            # This ensures sachets, boxes, twin-packs etc. are all normalized
             await conn.execute("""
                 CREATE TABLE wms.temp_sales_agg AS
                 SELECT
                     d."AcStockID" as stock_id,
-                    SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 7 THEN d."ItemQuantity" ELSE 0 END) as qty_7d,
+                    SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 7 THEN d."ItemQuantity" * COALESCE(sc."StockUOMRate", 1) ELSE 0 END) as qty_7d,
                     SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 7 THEN d."ItemTotal" ELSE 0 END) as rev_7d,
                     SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 7 THEN d."ItemTotal" - d."ItemQuantity" * d."ItemCost" ELSE 0 END) as gp_7d,
-                    SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 14 THEN d."ItemQuantity" ELSE 0 END) as qty_14d,
-                    SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 30 THEN d."ItemQuantity" ELSE 0 END) as qty_30d,
+                    SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 14 THEN d."ItemQuantity" * COALESCE(sc."StockUOMRate", 1) ELSE 0 END) as qty_14d,
+                    SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 30 THEN d."ItemQuantity" * COALESCE(sc."StockUOMRate", 1) ELSE 0 END) as qty_30d,
                     SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 30 THEN d."ItemTotal" ELSE 0 END) as rev_30d,
                     SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 30 THEN d."ItemTotal" - d."ItemQuantity" * d."ItemCost" ELSE 0 END) as gp_30d,
                     COUNT(DISTINCT CASE WHEN m."DocumentDate" >= CURRENT_DATE - 30 THEN m."DocumentDate"::date END) as selling_days_30d,
-                    SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 90 THEN d."ItemQuantity" ELSE 0 END) as qty_90d,
+                    SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 90 THEN d."ItemQuantity" * COALESCE(sc."StockUOMRate", 1) ELSE 0 END) as qty_90d,
                     SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 90 THEN d."ItemTotal" ELSE 0 END) as rev_90d,
                     SUM(CASE WHEN m."DocumentDate" >= CURRENT_DATE - 90 THEN d."ItemTotal" - d."ItemQuantity" * d."ItemCost" ELSE 0 END) as gp_90d,
                     COUNT(DISTINCT CASE WHEN m."DocumentDate" >= CURRENT_DATE - 90 THEN m."DocumentDate"::date END) as selling_days_90d,
-                    SUM(d."ItemQuantity") as qty_365d,
+                    SUM(d."ItemQuantity" * COALESCE(sc."StockUOMRate", 1)) as qty_365d,
                     SUM(d."ItemTotal") as rev_365d,
                     SUM(d."ItemTotal" - d."ItemQuantity" * d."ItemCost") as gp_365d,
                     MIN(m."DocumentDate"::date) as first_sale,
                     MAX(m."DocumentDate"::date) as last_sale
                 FROM "AcCSD" d
                 INNER JOIN "AcCSM" m ON d."DocumentNo" = m."DocumentNo"
+                LEFT JOIN "AcStockCompany" sc ON d."AcStockID" = sc."AcStockID" AND d."AcStockUOMID" = sc."AcStockUOMID"
                 WHERE m."DocumentDate" >= CURRENT_DATE - 365
                 GROUP BY d."AcStockID"
             """)
             steps_completed.append("sales_agg")
 
             # Step 2: Create CV temp table
+            # Also use UOM-converted quantities for coefficient of variation
             await conn.execute("DROP TABLE IF EXISTS wms.temp_cv")
             await conn.execute("""
                 CREATE TABLE wms.temp_cv AS
                 SELECT stock_id, CASE WHEN AVG(monthly_qty) > 0 THEN STDDEV(monthly_qty) / AVG(monthly_qty) ELSE NULL END as cv
                 FROM (
                     SELECT d."AcStockID" as stock_id, DATE_TRUNC('month', m."DocumentDate") as month,
-                           SUM(d."ItemQuantity") as monthly_qty
-                    FROM "AcCSD" d INNER JOIN "AcCSM" m ON d."DocumentNo" = m."DocumentNo"
+                           SUM(d."ItemQuantity" * COALESCE(sc."StockUOMRate", 1)) as monthly_qty
+                    FROM "AcCSD" d
+                    INNER JOIN "AcCSM" m ON d."DocumentNo" = m."DocumentNo"
+                    LEFT JOIN "AcStockCompany" sc ON d."AcStockID" = sc."AcStockID" AND d."AcStockUOMID" = sc."AcStockUOMID"
                     WHERE m."DocumentDate" >= CURRENT_DATE - 365
                     GROUP BY d."AcStockID", DATE_TRUNC('month', m."DocumentDate")
                 ) ms
@@ -3356,13 +3362,15 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
             # Step 1: Calculate monthly sales for last 12 months
             # Use AcStockBalanceDetail (already indexed) instead of raw AcCSD/AcCusInvoiceD tables
             # M1 = current month, M12 = 12 months ago
+            # IMPORTANT: Use RootUomQuantityOut which is already converted to BASE UOM
+            # This ensures all UOMs (sachets, boxes, twin-packs) are normalized
             # Set 5 minute timeout for this heavy query
             await conn.execute("""
                 WITH monthly_sales AS (
                     SELECT
                         "AcStockID" as stock_id,
                         DATE_TRUNC('month', "DocumentDate") as sale_month,
-                        SUM("QuantityOut") as qty
+                        SUM("RootUomQuantityOut") as qty
                     FROM "AcStockBalanceDetail"
                     WHERE "DocumentDate" >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '12 months'
                       AND "DocumentType" IN ('CUS_CASH_SALES', 'CUS_INVOICE')
@@ -3819,7 +3827,15 @@ async def get_sku_intelligence(
                     trend_status, trend_7d_vs_30d,
                     ams_3m, seasonality_type, velocity_category,
                     lead_time_category, reorder_recommendation,
-                    last_updated
+                    last_updated,
+                    -- UOM info for display
+                    order_uom, order_uom_desc, order_uom_rate, base_uom, base_uom_desc,
+                    balance_in_order_uom,
+                    -- Quantities converted to ORDER UOM for meaningful display
+                    ROUND(COALESCE(ams_3m, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as ams_3m_order,
+                    ROUND(COALESCE(qty_last_30d, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as qty_last_30d_order,
+                    ROUND(COALESCE(qty_last_90d, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as qty_last_90d_order,
+                    ROUND(COALESCE(qty_last_365d, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as qty_last_365d_order
                 FROM wms.stock_movement_summary
                 WHERE {where_clause}
                 ORDER BY revenue_last_365d DESC NULLS LAST
