@@ -3110,7 +3110,7 @@ async def refresh_stock_movement(api_key: str = Query(...)):
                     stability_score, doi_score, strategic_score,
                     revenue_last_30d, revenue_last_90d, revenue_last_365d,
                     gp_last_30d, gp_last_90d, gp_last_365d, gp_margin_pct,
-                    base_uom, order_uom, order_uom_rate, balance_in_order_uom,
+                    base_uom, base_uom_desc, order_uom, order_uom_desc, order_uom_rate, balance_in_order_uom,
                     current_balance, inventory_value, days_of_inventory, stockout_risk,
                     suggested_reorder_point, suggested_reorder_qty,
                     last_sale_date, first_sale_date, last_updated
@@ -3147,14 +3147,15 @@ async def refresh_stock_movement(api_key: str = Query(...)):
                     -- Combine: PO history > Invoice history > Largest UOM
                     SELECT sc."AcStockID" as stock_id,
                            COALESCE(pu.purchase_uom, pui.purchase_uom, sc_max."AcStockUOMID") as order_uom,
-                           COALESCE(sc_pu."StockUOMRate", sc_pui."StockUOMRate", sc_max."StockUOMRate", 1) as order_uom_rate
+                           COALESCE(sc_pu."StockUOMRate", sc_pui."StockUOMRate", sc_max."StockUOMRate", 1) as order_uom_rate,
+                           COALESCE(sc_pu."StockDescription1", sc_pui."StockDescription1", sc_max."StockDescription1") as order_uom_desc
                     FROM "AcStockCompany" sc
                     LEFT JOIN purchase_uom pu ON sc."AcStockID" = pu.stock_id
                     LEFT JOIN purchase_uom_inv pui ON sc."AcStockID" = pui.stock_id
                     LEFT JOIN "AcStockCompany" sc_pu ON sc."AcStockID" = sc_pu."AcStockID" AND pu.purchase_uom = sc_pu."AcStockUOMID"
                     LEFT JOIN "AcStockCompany" sc_pui ON sc."AcStockID" = sc_pui."AcStockID" AND pui.purchase_uom = sc_pui."AcStockUOMID"
                     LEFT JOIN LATERAL (
-                        SELECT "AcStockUOMID", "StockUOMRate"
+                        SELECT "AcStockUOMID", "StockUOMRate", "StockDescription1"
                         FROM "AcStockCompany" sc2
                         WHERE sc2."AcStockID" = sc."AcStockID" AND sc2."StockIsActive" = 'Y'
                         ORDER BY "StockUOMRate" DESC LIMIT 1
@@ -3216,7 +3217,9 @@ async def refresh_stock_movement(api_key: str = Query(...)):
                     ROUND(CASE WHEN COALESCE(s.rev_365d, 0) > 0 THEN COALESCE(s.gp_365d, 0) / s.rev_365d * 100 ELSE 0 END::numeric, 1),
                     -- UOM info for purchasing
                     sc."AcStockUOMIDBaseID",
+                    sc."StockDescription1",
                     COALESCE(ou.order_uom, sc."AcStockUOMIDBaseID"),
+                    COALESCE(ou.order_uom_desc, sc."StockDescription1"),
                     COALESCE(ou.order_uom_rate, 1),
                     ROUND(COALESCE(sb.balance, 0) / COALESCE(ou.order_uom_rate, 1), 0),
                     -- Inventory
@@ -3430,18 +3433,10 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
                     END,
                     seasonality_type = CASE
                         WHEN ams_3m = 0 OR ams_3m IS NULL THEN 'DEAD'
-                        WHEN LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
-                                   qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) > 0
-                             AND GREATEST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
-                                          qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) /
-                                 LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
-                                       qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) > 3.0 THEN 'HIGHLY_SEASONAL'
-                        WHEN LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
-                                   qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) > 0
-                             AND GREATEST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
-                                          qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) /
-                                 LEAST(qty_m1, qty_m2, qty_m3, qty_m4, qty_m5, qty_m6,
-                                       qty_m7, qty_m8, qty_m9, qty_m10, qty_m11, qty_m12) >= 1.5 THEN 'MODERATELY_SEASONAL'
+                        -- Use CV (coefficient of variation) which is more robust than peak/trough
+                        -- CV > 0.8 = high variability (erratic/seasonal), CV 0.5-0.8 = moderate, CV < 0.5 = stable
+                        WHEN cv_value > 0.8 AND seasonal_peak_trough_ratio > 5.0 THEN 'HIGHLY_SEASONAL'
+                        WHEN cv_value > 0.5 OR (seasonal_peak_trough_ratio IS NOT NULL AND seasonal_peak_trough_ratio > 2.0) THEN 'MODERATELY_SEASONAL'
                         ELSE 'STABLE'
                     END
             """)
@@ -3475,9 +3470,10 @@ async def analyze_monthly_movement(api_key: str = Query(...)):
             await conn.execute("""
                 UPDATE wms.stock_movement_summary
                 SET target_doi = CASE
-                    WHEN ud1_code = 'FLTHB' THEN 150      -- House Brand: 5 months (lead + buffer)
-                    WHEN abc_class = 'A' THEN 45          -- Class A: 45 days
-                    WHEN abc_class = 'B' THEN 60          -- Class B: 60 days
+                    WHEN ud1_code = 'FLTHB' THEN 120      -- House Brand: 4 months (2-4 month lead time + safety)
+                    WHEN ud1_code = 'FLTF1' THEN 100      -- Focused Item 1: Similar lead time
+                    WHEN abc_class = 'A' THEN 60          -- Class A: 60 days (frequent replenishment)
+                    WHEN abc_class = 'B' THEN 75          -- Class B: 75 days
                     ELSE 90                                -- Class C: 90 days
                 END
             """)
