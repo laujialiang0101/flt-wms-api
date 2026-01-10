@@ -3043,7 +3043,9 @@ async def refresh_stock_movement(api_key: str = Query(...)):
             steps_completed = []
 
             # Step 1: Create temp tables for aggregated sales data
-            await conn.execute("DROP TABLE IF EXISTS wms.temp_sales_agg")
+            # Use CASCADE to also drop associated types
+            await conn.execute("DROP TABLE IF EXISTS wms.temp_sales_agg CASCADE")
+            await conn.execute("DROP TYPE IF EXISTS wms.temp_sales_agg CASCADE")
             steps_completed.append("drop_temp")
 
             # Create aggregated sales temp table (single pass through AcCSD)
@@ -3081,7 +3083,8 @@ async def refresh_stock_movement(api_key: str = Query(...)):
 
             # Step 2: Create CV temp table
             # Also use UOM-converted quantities for coefficient of variation
-            await conn.execute("DROP TABLE IF EXISTS wms.temp_cv")
+            await conn.execute("DROP TABLE IF EXISTS wms.temp_cv CASCADE")
+            await conn.execute("DROP TYPE IF EXISTS wms.temp_cv CASCADE")
             await conn.execute("""
                 CREATE TABLE wms.temp_cv AS
                 SELECT stock_id, CASE WHEN AVG(monthly_qty) > 0 THEN STDDEV(monthly_qty) / AVG(monthly_qty) ELSE NULL END as cv
