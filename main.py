@@ -2881,6 +2881,7 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
                     ud1_code VARCHAR(50),
                     ud2_suggested VARCHAR(10),
                     therapeutic_group VARCHAR(100),
+                    product_family VARCHAR(100),
                     active_ingredient TEXT,
 
                     qty_last_7d NUMERIC DEFAULT 0,
@@ -2934,6 +2935,13 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
                     house_brand_name VARCHAR(200),
                     house_brand_gp_margin NUMERIC,
                     margin_opportunity_monthly NUMERIC,
+
+                    base_uom VARCHAR(20),
+                    base_uom_desc VARCHAR(50),
+                    order_uom VARCHAR(20),
+                    order_uom_desc VARCHAR(50),
+                    order_uom_rate NUMERIC DEFAULT 1,
+                    balance_in_order_uom NUMERIC,
 
                     last_sale_date DATE,
                     first_sale_date DATE,
