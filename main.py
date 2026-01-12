@@ -3767,17 +3767,22 @@ async def setup_analytics(api_key: str = Query(...)):
 @app.get("/api/v1/analytics/sku-intelligence")
 async def get_sku_intelligence(
     api_key: str = Query(...),
-    abc_class: Optional[str] = Query(default=None, description="Filter by ABC class: A, B, C"),
-    xyz_class: Optional[str] = Query(default=None, description="Filter by XYZ class: X, Y, Z"),
-    margin_category: Optional[str] = Query(default=None, description="LOW_MARGIN, MEDIUM_MARGIN, GOOD_MARGIN, HIGH_MARGIN"),
-    stock_status: Optional[str] = Query(default=None, description="STOCKOUT, LOW, OK, OVERSTOCKED"),
-    seasonality: Optional[str] = Query(default=None, description="HIGHLY_SEASONAL, MODERATELY_SEASONAL, STABLE, DEAD"),
+    demand_pattern: Optional[str] = Query(default=None, description="Filter by demand pattern: DEAD, NEW, DISC, SPORADIC, STRONG_DECLINE, DECLINE, STABLE, GROWTH, STRONG_GROWTH"),
+    variability_class: Optional[str] = Query(default=None, description="Filter by variability: V1-V7"),
+    seasonal_type: Optional[str] = Query(default=None, description="Filter by season: MONSOON, Q4_PEAK, Q1_PEAK, SCHOOL, NONE"),
+    reorder_recommendation: Optional[str] = Query(default=None, description="Filter by action: STOCKOUT, ORDER_NOW, ORDER_SOON, OPTIMAL, REDUCE, OVERSTOCKED, DELIST, REVIEW"),
     ud1_code: Optional[str] = Query(default=None, description="Filter by UD1 (e.g., FLTHB for House Brand)"),
     search: Optional[str] = Query(default=None, description="Search by stock code or name"),
-    limit: int = Query(default=100, le=1000),
+    limit: int = Query(default=100, le=50000),
     offset: int = Query(default=0)
 ):
-    """Query SKU intelligence from wms.stock_movement_summary."""
+    """Query SKU intelligence from wms.stock_movement_summary.
+
+    Uses the NEW classification system:
+    - demand_pattern: PRIMARY classification (data sufficiency + trend)
+    - variability_class: SECONDARY classification (V1-V7 based on CV)
+    - seasonal_type_new: TERTIARY classification (seasonality pattern)
+    """
     verify_api_key(api_key)
 
     try:
@@ -3787,37 +3792,24 @@ async def get_sku_intelligence(
             params = []
             param_idx = 1
 
-            if abc_class:
-                conditions.append(f"abc_class = ${param_idx}")
-                params.append(abc_class)
+            if demand_pattern:
+                conditions.append(f"demand_pattern = ${param_idx}")
+                params.append(demand_pattern)
                 param_idx += 1
 
-            if xyz_class:
-                conditions.append(f"xyz_class = ${param_idx}")
-                params.append(xyz_class)
+            if variability_class:
+                conditions.append(f"variability_class = ${param_idx}")
+                params.append(variability_class)
                 param_idx += 1
 
-            if margin_category:
-                margin_ranges = {
-                    'LOW_MARGIN': (0, 15),
-                    'MEDIUM_MARGIN': (15, 30),
-                    'GOOD_MARGIN': (30, 45),
-                    'HIGH_MARGIN': (45, 100)
-                }
-                if margin_category in margin_ranges:
-                    low, high = margin_ranges[margin_category]
-                    conditions.append(f"gp_margin_pct >= ${param_idx} AND gp_margin_pct < ${param_idx + 1}")
-                    params.extend([low, high])
-                    param_idx += 2
-
-            if stock_status:
-                conditions.append(f"stockout_risk = ${param_idx}")
-                params.append(stock_status)
+            if seasonal_type:
+                conditions.append(f"seasonal_type_new = ${param_idx}")
+                params.append(seasonal_type)
                 param_idx += 1
 
-            if seasonality:
-                conditions.append(f"seasonality_type = ${param_idx}")
-                params.append(seasonality)
+            if reorder_recommendation:
+                conditions.append(f"reorder_recommendation = ${param_idx}")
+                params.append(reorder_recommendation)
                 param_idx += 1
 
             if ud1_code:
@@ -3837,26 +3829,61 @@ async def get_sku_intelligence(
 
             query = f"""
                 SELECT
-                    stock_id, stock_name, barcode, category, brand, ud1_code,
-                    abc_class, xyz_class, abc_xyz_class, cv_value,
-                    gp_margin_pct, revenue_last_365d, qty_last_365d, gp_last_365d,
-                    revenue_last_90d, qty_last_90d, avg_daily_30d,
-                    current_balance, days_of_inventory, stockout_risk,
-                    trend_status, trend_7d_vs_30d,
-                    ams_3m, seasonality_type, velocity_category,
-                    lead_time_category, reorder_recommendation,
-                    last_updated,
-                    -- UOM info for display
-                    order_uom, order_uom_desc, order_uom_rate, base_uom, base_uom_desc,
+                    -- Product identification
+                    stock_id, stock_name, barcode, ud1_code,
+
+                    -- NEW Classification System (Primary -> Secondary -> Tertiary)
+                    demand_pattern,              -- PRIMARY: DEAD/NEW/DISC/SPORADIC/STRONG_DECLINE/DECLINE/STABLE/GROWTH/STRONG_GROWTH
+                    variability_class,           -- SECONDARY: V1-V7 (based on CV percentiles)
+                    seasonal_type_new,           -- TERTIARY: MONSOON/Q4_PEAK/Q1_PEAK/SCHOOL/NONE
+                    seasonal_intensity,          -- LOW/MEDIUM/HIGH
+
+                    -- Key Metrics
+                    cv_pct,                      -- Coefficient of Variation %
+                    trend_index,                 -- Normalized trend (0.5x-2.0x, 1.0 = market pace)
+                    momentum_status,             -- Current momentum
+                    momentum_index,              -- Momentum score
+
+                    -- Sales Velocity
+                    ams_calculated,              -- Average Monthly Sales (calculated)
+                    velocity_daily,              -- Daily velocity in base UOM
+                    ROUND(COALESCE(ams_calculated, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as ams_order_uom,
+
+                    -- Inventory
+                    current_balance,
                     balance_in_order_uom,
-                    -- Quantities converted to ORDER UOM for meaningful display
-                    ROUND(COALESCE(ams_3m, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as ams_3m_order,
-                    ROUND(COALESCE(qty_last_30d, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as qty_last_30d_order,
-                    ROUND(COALESCE(qty_last_90d, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as qty_last_90d_order,
-                    ROUND(COALESCE(qty_last_365d, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 1) as qty_last_365d_order
+                    days_of_inventory,
+                    reorder_point,
+                    max_stock,
+                    safety_multiplier,
+
+                    -- Action
+                    reorder_recommendation,
+                    ams_action,
+
+                    -- UOM info
+                    order_uom, order_uom_desc, order_uom_rate,
+                    base_uom, base_uom_desc,
+
+                    -- Metadata
+                    last_updated,
+                    peak_months
                 FROM wms.stock_movement_summary
                 WHERE {where_clause}
-                ORDER BY revenue_last_365d DESC NULLS LAST
+                ORDER BY
+                    CASE demand_pattern
+                        WHEN 'STRONG_GROWTH' THEN 1
+                        WHEN 'GROWTH' THEN 2
+                        WHEN 'STABLE' THEN 3
+                        WHEN 'NEW' THEN 4
+                        WHEN 'DECLINE' THEN 5
+                        WHEN 'STRONG_DECLINE' THEN 6
+                        WHEN 'SPORADIC' THEN 7
+                        WHEN 'DISC' THEN 8
+                        WHEN 'DEAD' THEN 9
+                        ELSE 10
+                    END,
+                    current_balance DESC NULLS LAST
                 LIMIT ${param_idx} OFFSET ${param_idx + 1}
             """
 
