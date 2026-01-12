@@ -3889,15 +3889,31 @@ async def get_sku_intelligence(
 
             rows = await conn.fetch(query, *params)
 
-            # Get total count
+            # Get total count (with current filters, excluding reorder_recommendation filter for summary)
             count_query = f"SELECT COUNT(*) FROM wms.stock_movement_summary WHERE {where_clause}"
             total = await conn.fetchval(count_query, *params[:-2]) if params[:-2] else await conn.fetchval("SELECT COUNT(*) FROM wms.stock_movement_summary")
+
+            # Get summary counts by reorder_recommendation (apply all filters EXCEPT reorder_recommendation)
+            # This gives us the true counts for the action cards
+            summary_conditions = [c for c in conditions if 'reorder_recommendation' not in c]
+            summary_params = [p for i, p in enumerate(params[:-2]) if i < len(conditions) and 'reorder_recommendation' not in conditions[i]]
+            summary_where = " AND ".join(summary_conditions) if summary_conditions else "TRUE"
+
+            summary_query = f"""
+                SELECT reorder_recommendation, COUNT(*) as count
+                FROM wms.stock_movement_summary
+                WHERE {summary_where}
+                GROUP BY reorder_recommendation
+            """
+            summary_rows = await conn.fetch(summary_query, *summary_params) if summary_params else await conn.fetch(summary_query)
+            summary = {row['reorder_recommendation'] or 'UNKNOWN': row['count'] for row in summary_rows}
 
             return {
                 "status": "success",
                 "total": total,
                 "limit": limit,
                 "offset": offset,
+                "summary": summary,
                 "data": [dict(row) for row in rows]
             }
     except Exception as e:
