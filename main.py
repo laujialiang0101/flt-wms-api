@@ -4074,6 +4074,13 @@ async def get_outlet_sku_intelligence(
                     ROUND(COALESCE(sml.ams_12m, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 2) as ams_12m,
                     sml.pct_of_total,
 
+                    -- Demand-pattern adjusted AMS (same methodology as SKU Intelligence)
+                    ROUND(COALESCE(sml.ams_calculated, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 2) as ams_calculated,
+                    COALESCE(sml.velocity_daily, 0) as velocity_daily,
+                    COALESCE(sml.safety_days, 0) as safety_days,
+                    ROUND(COALESCE(sml.reorder_point, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as reorder_point,
+                    ROUND(COALESCE(sml.max_stock, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as max_stock,
+
                     -- Live inventory
                     COALESCE(sml.current_balance, 0) as current_balance,
                     ROUND(COALESCE(sml.current_balance, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as balance_in_order_uom,
@@ -4090,7 +4097,7 @@ async def get_outlet_sku_intelligence(
                 FROM wms.stock_movement_by_location sml
                 LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
                 WHERE {where_clause}
-                ORDER BY sml.ams_12m DESC NULLS LAST, sml.current_balance DESC NULLS LAST
+                ORDER BY sml.ams_calculated DESC NULLS LAST, sml.current_balance DESC NULLS LAST
                 LIMIT ${param_idx} OFFSET ${param_idx + 1}
             """
 
