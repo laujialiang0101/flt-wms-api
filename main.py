@@ -4033,7 +4033,7 @@ async def get_outlet_sku_intelligence(
                 param_idx += 1
 
             if search:
-                conditions.append(f"(sml.stock_id ILIKE ${param_idx} OR sml.stock_name ILIKE ${param_idx})")
+                conditions.append(f"(sml.stock_id ILIKE ${param_idx} OR sml.stock_name ILIKE ${param_idx} OR sms.brand ILIKE ${param_idx})")
                 params.append(f"%{search}%")
                 param_idx += 1
 
