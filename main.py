@@ -4115,24 +4115,54 @@ async def get_outlet_sku_intelligence(
 
             rows = await conn.fetch(query, *params)
 
-            # Get total count
-            count_query = f"""
-                SELECT COUNT(*)
-                FROM wms.stock_movement_by_location sml
-                LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
-                WHERE {where_clause}
-            """
-            total = await conn.fetchval(count_query, *params[:-2])
-
-            # Get summary counts by reorder_recommendation
-            summary_query = """
-                SELECT reorder_recommendation, COUNT(*) as count
-                FROM wms.stock_movement_by_location
+            # HYBRID APPROACH: Use pre-aggregated summary table for fast counts
+            # Get summary from wms.outlet_sku_summary (pre-aggregated, instant)
+            summary_row = await conn.fetchrow("""
+                SELECT total_skus, stockout_count, order_now_count, order_soon_count,
+                       optimal_count, overstocked_count, review_count
+                FROM wms.outlet_sku_summary
                 WHERE location_id = $1
-                GROUP BY reorder_recommendation
-            """
-            summary_rows = await conn.fetch(summary_query, outlet_id)
-            summary = {row['reorder_recommendation'] or 'REVIEW': row['count'] for row in summary_rows}
+            """, outlet_id)
+
+            if summary_row:
+                summary = {
+                    'STOCKOUT': summary_row['stockout_count'],
+                    'ORDER_NOW': summary_row['order_now_count'],
+                    'ORDER_SOON': summary_row['order_soon_count'],
+                    'OPTIMAL': summary_row['optimal_count'],
+                    'OVERSTOCKED': summary_row['overstocked_count'],
+                    'REVIEW': summary_row['review_count']
+                }
+                # Use pre-aggregated total when no filters applied
+                if not reorder_recommendation and not ud1_code and not search:
+                    total = summary_row['total_skus']
+                else:
+                    # Only run slow COUNT when filters are applied
+                    count_query = f"""
+                        SELECT COUNT(*)
+                        FROM wms.stock_movement_by_location sml
+                        LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                        WHERE {where_clause}
+                    """
+                    total = await conn.fetchval(count_query, *params[:-2])
+            else:
+                # Fallback to slow query if summary table not populated
+                count_query = f"""
+                    SELECT COUNT(*)
+                    FROM wms.stock_movement_by_location sml
+                    LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                    WHERE {where_clause}
+                """
+                total = await conn.fetchval(count_query, *params[:-2])
+
+                summary_query = """
+                    SELECT reorder_recommendation, COUNT(*) as count
+                    FROM wms.stock_movement_by_location
+                    WHERE location_id = $1
+                    GROUP BY reorder_recommendation
+                """
+                summary_rows = await conn.fetch(summary_query, outlet_id)
+                summary = {row['reorder_recommendation'] or 'REVIEW': row['count'] for row in summary_rows}
 
             return {
                 "status": "success",
