@@ -4081,6 +4081,17 @@ async def get_outlet_sku_intelligence(
                     ROUND(COALESCE(sml.reorder_point, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as reorder_point,
                     ROUND(COALESCE(sml.max_stock, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as max_stock,
 
+                    -- Outlet-specific EOI fields (CV calculated from outlet's M1-M12)
+                    sml.outlet_cv,
+                    sml.outlet_variability_class,
+                    COALESCE(sml.outlet_safety_days, 0) as outlet_safety_days,
+                    ROUND(COALESCE(sml.order_up_to_level, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as order_up_to_level,
+                    -- Reorder Qty = Order Up To - Current Balance (in order UOM)
+                    GREATEST(0, ROUND(
+                        (COALESCE(sml.order_up_to_level, 0) - COALESCE(sml.current_balance, 0))
+                        / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1
+                    )) as reorder_qty,
+
                     -- Live inventory
                     COALESCE(sml.current_balance, 0) as current_balance,
                     ROUND(COALESCE(sml.current_balance, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as balance_in_order_uom,
@@ -4090,6 +4101,7 @@ async def get_outlet_sku_intelligence(
                     -- Company-wide classification (from main summary)
                     sms.demand_pattern,
                     sms.variability_class,
+                    sml.outlet_variability_class as outlet_var_class,  -- Include both for comparison
                     sms.trend_index,
                     sms.abc_class,
 
