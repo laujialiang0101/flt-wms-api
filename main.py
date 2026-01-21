@@ -3847,8 +3847,11 @@ async def get_sku_intelligence(
                     sms.stock_id, sms.stock_name, sms.order_uom_stock_name, sms.barcode, sms.ud1_code,
                     COALESCE(sc."StockIsActive" = 'Y', true) as is_active,  -- From AcStockCompany
 
-                    -- Monthly Sales (M1 = current month, M2 = last month, etc.) in ORDER UOM
-                    sms.qty_m1, sms.qty_m2, sms.qty_m3, sms.qty_m4,
+                    -- Monthly Sales (M1 = current month, M2 = last month, etc.) converted to ORDER UOM
+                    ROUND(COALESCE(sms.qty_m1, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as qty_m1,
+                    ROUND(COALESCE(sms.qty_m2, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as qty_m2,
+                    ROUND(COALESCE(sms.qty_m3, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as qty_m3,
+                    ROUND(COALESCE(sms.qty_m4, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as qty_m4,
 
                     -- NEW Classification System (Primary -> Secondary -> Tertiary)
                     sms.demand_pattern,              -- PRIMARY: DEAD/NEW/DISC/SPORADIC/STRONG_DECLINE/DECLINE/STABLE/GROWTH/STRONG_GROWTH
@@ -3897,7 +3900,8 @@ async def get_sku_intelligence(
                     sms.last_updated,
                     sms.peak_months
                 FROM wms.stock_movement_summary sms
-                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id AND sc."AcStockUOMID" = ''
+                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
+                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
                 WHERE {where_clause}
                 ORDER BY
                     CASE sms.demand_pattern
@@ -3922,7 +3926,8 @@ async def get_sku_intelligence(
             count_query = f"""
                 SELECT COUNT(*)
                 FROM wms.stock_movement_summary sms
-                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id AND sc."AcStockUOMID" = ''
+                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
+                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
                 WHERE {where_clause}
             """
             total = await conn.fetchval(count_query, *params[:-2]) if params[:-2] else await conn.fetchval("SELECT COUNT(*) FROM wms.stock_movement_summary")
