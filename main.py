@@ -3941,7 +3941,8 @@ async def get_sku_intelligence(
             summary_query = f"""
                 SELECT sms.reorder_recommendation, COUNT(*) as count
                 FROM wms.stock_movement_summary sms
-                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id AND sc."AcStockUOMID" = ''
+                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
+                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
                 WHERE {summary_where}
                 GROUP BY sms.reorder_recommendation
             """
