@@ -3774,6 +3774,7 @@ async def get_sku_intelligence(
     reorder_recommendation: Optional[str] = Query(default=None, description="Filter by action: STOCKOUT, ORDER_NOW, ORDER_SOON, OPTIMAL, REDUCE, OVERSTOCKED, DELIST, REVIEW"),
     ud1_code: Optional[str] = Query(default=None, description="Filter by UD1 (e.g., FLTHB for House Brand)"),
     is_active: Optional[str] = Query(default=None, description="Filter by active status: Y (active), N (inactive), or empty for all"),
+    review_flag: Optional[str] = Query(default=None, description="Filter by review flag: NEW_ITEM, RECLASSIFY, AMS_CHECK, RECLASSIFIED"),
     search: Optional[str] = Query(default=None, description="Search by stock code or name"),
     limit: int = Query(default=100, le=50000),
     offset: int = Query(default=0)
@@ -3830,6 +3831,15 @@ async def get_sku_intelligence(
                     conditions.append(f"sc.\"StockIsActive\" = 'Y'")
                 else:
                     conditions.append(f"(sc.\"StockIsActive\" = 'N' OR sc.\"StockIsActive\" IS NULL)")
+
+            if review_flag:
+                if review_flag == 'NEEDS_REVIEW':
+                    # Show all items needing review (NEW_ITEM or AMS_CHECK, not yet reviewed)
+                    conditions.append(f"sms.review_flag IN ('NEW_ITEM', 'AMS_CHECK') AND sms.reviewed_at IS NULL")
+                else:
+                    conditions.append(f"sms.review_flag = ${param_idx}")
+                    params.append(review_flag)
+                    param_idx += 1
 
             if search:
                 conditions.append(f"(sms.stock_id ILIKE ${param_idx} OR sms.stock_name ILIKE ${param_idx} OR sms.barcode ILIKE ${param_idx})")
@@ -3898,7 +3908,15 @@ async def get_sku_intelligence(
 
                     -- Metadata
                     sms.last_updated,
-                    sms.peak_months
+                    sms.peak_months,
+
+                    -- Review fields
+                    sms.review_flag,
+                    sms.review_reason,
+                    sms.review_priority,
+                    sms.reviewed_at,
+                    sms.reviewed_by,
+                    sms.active_months
                 FROM wms.stock_movement_summary sms
                 LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
                     AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
@@ -3949,14 +3967,95 @@ async def get_sku_intelligence(
             summary_rows = await conn.fetch(summary_query, *summary_params) if summary_params else await conn.fetch(summary_query)
             summary = {row['reorder_recommendation'] or 'UNKNOWN': row['count'] for row in summary_rows}
 
+            # Get review summary counts (items needing attention)
+            review_query = f"""
+                SELECT
+                    review_flag,
+                    COUNT(*) as count
+                FROM wms.stock_movement_summary sms
+                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
+                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
+                WHERE {summary_where}
+                  AND sms.review_flag IS NOT NULL
+                GROUP BY sms.review_flag
+            """
+            review_rows = await conn.fetch(review_query, *summary_params) if summary_params else await conn.fetch(review_query)
+            review_summary = {row['review_flag']: row['count'] for row in review_rows}
+
+            # Calculate total needing review (NEW_ITEM + AMS_CHECK that haven't been reviewed)
+            needs_review_query = f"""
+                SELECT COUNT(*) as count
+                FROM wms.stock_movement_summary sms
+                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id
+                    AND sc."AcStockUOMID" = COALESCE(sms.order_uom, '')
+                WHERE {summary_where}
+                  AND sms.review_flag IN ('NEW_ITEM', 'AMS_CHECK')
+                  AND sms.reviewed_at IS NULL
+            """
+            needs_review_count = await conn.fetchval(needs_review_query, *summary_params) if summary_params else await conn.fetchval(needs_review_query)
+            review_summary['NEEDS_REVIEW'] = needs_review_count or 0
+
             return {
                 "status": "success",
                 "total": total,
                 "limit": limit,
                 "offset": offset,
                 "summary": summary,
+                "review_summary": review_summary,
                 "data": [dict(row) for row in rows]
             }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/analytics/sku-intelligence/review")
+async def update_sku_review(
+    api_key: str = Query(...),
+    stock_id: str = Query(..., description="Stock ID to update"),
+    action: str = Query(..., description="Action: APPROVE, DISMISS, FLAG"),
+    staff_id: str = Query(..., description="Staff ID performing the review"),
+    notes: Optional[str] = Query(default=None, description="Optional review notes")
+):
+    """Update review status for a SKU.
+
+    Actions:
+    - APPROVE: Mark as reviewed and approved (clears flag)
+    - DISMISS: Mark as reviewed and dismissed (clears flag)
+    - FLAG: Flag for further review with notes
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            if action == 'APPROVE':
+                await conn.execute("""
+                    UPDATE wms.stock_movement_summary
+                    SET reviewed_at = NOW(),
+                        reviewed_by = $2,
+                        review_notes = COALESCE($3, review_notes),
+                        review_flag = 'APPROVED'
+                    WHERE stock_id = $1
+                """, stock_id, staff_id, notes)
+            elif action == 'DISMISS':
+                await conn.execute("""
+                    UPDATE wms.stock_movement_summary
+                    SET reviewed_at = NOW(),
+                        reviewed_by = $2,
+                        review_notes = COALESCE($3, review_notes),
+                        review_flag = 'DISMISSED'
+                    WHERE stock_id = $1
+                """, stock_id, staff_id, notes)
+            elif action == 'FLAG':
+                await conn.execute("""
+                    UPDATE wms.stock_movement_summary
+                    SET review_notes = $3,
+                        review_priority = 1
+                    WHERE stock_id = $1
+                """, stock_id, staff_id, notes)
+            else:
+                raise HTTPException(status_code=400, detail="Invalid action. Use APPROVE, DISMISS, or FLAG")
+
+            return {"status": "success", "stock_id": stock_id, "action": action}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
