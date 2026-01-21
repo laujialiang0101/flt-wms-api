@@ -3847,11 +3847,11 @@ async def get_sku_intelligence(
                     sms.stock_id, sms.stock_name, sms.order_uom_stock_name, sms.barcode, sms.ud1_code,
                     COALESCE(sc."StockIsActive" = 'Y', true) as is_active,  -- From AcStockCompany
 
-                    -- Monthly Sales (M1 = current month, M2 = last month, etc.) converted to ORDER UOM
-                    ROUND(COALESCE(sms.qty_m1, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as qty_m1,
-                    ROUND(COALESCE(sms.qty_m2, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as qty_m2,
-                    ROUND(COALESCE(sms.qty_m3, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as qty_m3,
-                    ROUND(COALESCE(sms.qty_m4, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as qty_m4,
+                    -- Monthly Sales (M1 = current month, M2 = last month, etc.) - stored in BASE UOM, converted to ORDER UOM
+                    ROUND(COALESCE(sms.qty_m1, 0) / NULLIF(sms.order_uom_rate, 0), 1) as qty_m1,
+                    ROUND(COALESCE(sms.qty_m2, 0) / NULLIF(sms.order_uom_rate, 0), 1) as qty_m2,
+                    ROUND(COALESCE(sms.qty_m3, 0) / NULLIF(sms.order_uom_rate, 0), 1) as qty_m3,
+                    ROUND(COALESCE(sms.qty_m4, 0) / NULLIF(sms.order_uom_rate, 0), 1) as qty_m4,
 
                     -- NEW Classification System (Primary -> Secondary -> Tertiary)
                     sms.demand_pattern,              -- PRIMARY: DEAD/NEW/DISC/SPORADIC/STRONG_DECLINE/DECLINE/STABLE/GROWTH/STRONG_GROWTH
@@ -3865,23 +3865,23 @@ async def get_sku_intelligence(
                     sms.momentum_status,             -- Current momentum
                     sms.momentum_index,              -- Momentum score
 
-                    -- Sales Velocity (ams_calculated is already in ORDER UOM from EOI script)
-                    sms.ams_calculated,              -- Average Monthly Sales in ORDER UOM
-                    sms.ams_base_uom,                -- Average Monthly Sales in BASE UOM
-                    sms.velocity_daily,              -- Daily velocity in ORDER UOM
-                    sms.ams_calculated as ams_order_uom,  -- Same as ams_calculated (already in order UOM)
+                    -- Sales Velocity - stored in BASE UOM, converted to ORDER UOM (same as outlet intelligence)
+                    ROUND(COALESCE(sms.ams_calculated, 0) / NULLIF(sms.order_uom_rate, 0), 2) as ams_calculated,
+                    sms.ams_base_uom,                -- Average Monthly Sales in BASE UOM (raw)
+                    sms.velocity_daily,              -- Daily velocity (raw)
+                    ROUND(COALESCE(sms.ams_calculated, 0) / NULLIF(sms.order_uom_rate, 0), 2) as ams_order_uom,
 
-                    -- Inventory
+                    -- Inventory - stored in BASE UOM, converted to ORDER UOM
                     sms.current_balance,
-                    ROUND(COALESCE(sms.current_balance, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as balance_in_order_uom,
+                    ROUND(COALESCE(sms.current_balance, 0) / NULLIF(sms.order_uom_rate, 0), 0) as balance_in_order_uom,
                     sms.days_of_inventory,
-                    sms.reorder_point,
-                    sms.max_stock,
+                    ROUND(COALESCE(sms.reorder_point, 0) / NULLIF(sms.order_uom_rate, 0), 1) as reorder_point,
+                    ROUND(COALESCE(sms.max_stock, 0) / NULLIF(sms.order_uom_rate, 0), 1) as max_stock,
                     sms.safety_multiplier,
 
-                    -- EOI Framework columns (NEW)
-                    sms.safety_days,                 -- Safety buffer in days
-                    sms.order_up_to_level,           -- EOI Order Up To level in ORDER UOM
+                    -- EOI Framework columns - stored in BASE UOM, converted to ORDER UOM
+                    sms.safety_days,                 -- Safety buffer in days (no conversion needed)
+                    ROUND(COALESCE(sms.order_up_to_level, 0) / NULLIF(sms.order_uom_rate, 0), 1) as order_up_to_level,
                     sms.ams_status,                  -- Status description
 
                     -- ABC Classification
