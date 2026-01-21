@@ -3770,8 +3770,10 @@ async def get_sku_intelligence(
     demand_pattern: Optional[str] = Query(default=None, description="Filter by demand pattern: DEAD, NEW, DISC, SPORADIC, STRONG_DECLINE, DECLINE, STABLE, GROWTH, STRONG_GROWTH"),
     variability_class: Optional[str] = Query(default=None, description="Filter by variability: V1-V7"),
     seasonal_type: Optional[str] = Query(default=None, description="Filter by season: MONSOON, Q4_PEAK, Q1_PEAK, SCHOOL, NONE"),
+    seasonal_intensity: Optional[str] = Query(default=None, description="Filter by seasonal intensity: TRUE_SEASONAL, MODERATE, VARIABLE, STABLE"),
     reorder_recommendation: Optional[str] = Query(default=None, description="Filter by action: STOCKOUT, ORDER_NOW, ORDER_SOON, OPTIMAL, REDUCE, OVERSTOCKED, DELIST, REVIEW"),
     ud1_code: Optional[str] = Query(default=None, description="Filter by UD1 (e.g., FLTHB for House Brand)"),
+    is_active: Optional[str] = Query(default=None, description="Filter by active status: Y (active), N (inactive), or empty for all"),
     search: Optional[str] = Query(default=None, description="Search by stock code or name"),
     limit: int = Query(default=100, le=50000),
     offset: int = Query(default=0)
@@ -3793,32 +3795,44 @@ async def get_sku_intelligence(
             param_idx = 1
 
             if demand_pattern:
-                conditions.append(f"demand_pattern = ${param_idx}")
+                conditions.append(f"sms.demand_pattern = ${param_idx}")
                 params.append(demand_pattern)
                 param_idx += 1
 
             if variability_class:
-                conditions.append(f"variability_class = ${param_idx}")
+                conditions.append(f"sms.variability_class = ${param_idx}")
                 params.append(variability_class)
                 param_idx += 1
 
             if seasonal_type:
-                conditions.append(f"seasonal_type_new = ${param_idx}")
+                conditions.append(f"sms.seasonal_type_new = ${param_idx}")
                 params.append(seasonal_type)
                 param_idx += 1
 
+            if seasonal_intensity:
+                conditions.append(f"sms.seasonal_intensity = ${param_idx}")
+                params.append(seasonal_intensity)
+                param_idx += 1
+
             if reorder_recommendation:
-                conditions.append(f"reorder_recommendation = ${param_idx}")
+                conditions.append(f"sms.reorder_recommendation = ${param_idx}")
                 params.append(reorder_recommendation)
                 param_idx += 1
 
             if ud1_code:
-                conditions.append(f"ud1_code = ${param_idx}")
+                conditions.append(f"sms.ud1_code = ${param_idx}")
                 params.append(ud1_code)
                 param_idx += 1
 
+            if is_active:
+                # Filter by StockIsActive from AcStockCompany
+                if is_active == 'Y':
+                    conditions.append(f"sc.\"StockIsActive\" = 'Y'")
+                else:
+                    conditions.append(f"(sc.\"StockIsActive\" = 'N' OR sc.\"StockIsActive\" IS NULL)")
+
             if search:
-                conditions.append(f"(stock_id ILIKE ${param_idx} OR stock_name ILIKE ${param_idx} OR barcode ILIKE ${param_idx})")
+                conditions.append(f"(sms.stock_id ILIKE ${param_idx} OR sms.stock_name ILIKE ${param_idx} OR sms.barcode ILIKE ${param_idx})")
                 params.append(f"%{search}%")
                 param_idx += 1
 
@@ -3830,58 +3844,63 @@ async def get_sku_intelligence(
             query = f"""
                 SELECT
                     -- Product identification
-                    stock_id, stock_name, order_uom_stock_name, barcode, ud1_code,
+                    sms.stock_id, sms.stock_name, sms.order_uom_stock_name, sms.barcode, sms.ud1_code,
+                    COALESCE(sc."StockIsActive" = 'Y', true) as is_active,  -- From AcStockCompany
+
+                    -- Monthly Sales (M1 = current month, M2 = last month, etc.) in ORDER UOM
+                    sms.qty_m1, sms.qty_m2, sms.qty_m3, sms.qty_m4,
 
                     -- NEW Classification System (Primary -> Secondary -> Tertiary)
-                    demand_pattern,              -- PRIMARY: DEAD/NEW/DISC/SPORADIC/STRONG_DECLINE/DECLINE/STABLE/GROWTH/STRONG_GROWTH
-                    variability_class,           -- SECONDARY: V1-V7 (based on CV percentiles)
-                    seasonal_type_new,           -- TERTIARY: MONSOON/Q4_PEAK/Q1_PEAK/SCHOOL/NONE
-                    seasonal_intensity,          -- LOW/MEDIUM/HIGH
+                    sms.demand_pattern,              -- PRIMARY: DEAD/NEW/DISC/SPORADIC/STRONG_DECLINE/DECLINE/STABLE/GROWTH/STRONG_GROWTH
+                    sms.variability_class,           -- SECONDARY: V1-V7 (based on CV percentiles)
+                    sms.seasonal_type_new,           -- TERTIARY: MONSOON/Q4_PEAK/Q1_PEAK/SCHOOL/NONE
+                    sms.seasonal_intensity,          -- TRUE_SEASONAL/MODERATE/VARIABLE/STABLE
 
                     -- Key Metrics
-                    cv_pct,                      -- Coefficient of Variation %
-                    trend_index,                 -- Normalized trend (0.5x-2.0x, 1.0 = market pace)
-                    momentum_status,             -- Current momentum
-                    momentum_index,              -- Momentum score
+                    sms.cv_pct,                      -- Coefficient of Variation %
+                    sms.trend_index,                 -- Normalized trend (0.5x-2.0x, 1.0 = market pace)
+                    sms.momentum_status,             -- Current momentum
+                    sms.momentum_index,              -- Momentum score
 
                     -- Sales Velocity (ams_calculated is already in ORDER UOM from EOI script)
-                    ams_calculated,              -- Average Monthly Sales in ORDER UOM
-                    ams_base_uom,                -- Average Monthly Sales in BASE UOM
-                    velocity_daily,              -- Daily velocity in ORDER UOM
-                    ams_calculated as ams_order_uom,  -- Same as ams_calculated (already in order UOM)
+                    sms.ams_calculated,              -- Average Monthly Sales in ORDER UOM
+                    sms.ams_base_uom,                -- Average Monthly Sales in BASE UOM
+                    sms.velocity_daily,              -- Daily velocity in ORDER UOM
+                    sms.ams_calculated as ams_order_uom,  -- Same as ams_calculated (already in order UOM)
 
                     -- Inventory
-                    current_balance,
-                    ROUND(COALESCE(current_balance, 0) / NULLIF(COALESCE(order_uom_rate, 1), 0), 0) as balance_in_order_uom,
-                    days_of_inventory,
-                    reorder_point,
-                    max_stock,
-                    safety_multiplier,
+                    sms.current_balance,
+                    ROUND(COALESCE(sms.current_balance, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 0) as balance_in_order_uom,
+                    sms.days_of_inventory,
+                    sms.reorder_point,
+                    sms.max_stock,
+                    sms.safety_multiplier,
 
                     -- EOI Framework columns (NEW)
-                    safety_days,                 -- Safety buffer in days
-                    order_up_to_level,           -- EOI Order Up To level in ORDER UOM
-                    ams_status,                  -- Status description
+                    sms.safety_days,                 -- Safety buffer in days
+                    sms.order_up_to_level,           -- EOI Order Up To level in ORDER UOM
+                    sms.ams_status,                  -- Status description
 
                     -- ABC Classification
-                    abc_class,
-                    gp_abc_class,
+                    sms.abc_class,
+                    sms.gp_abc_class,
 
                     -- Action
-                    reorder_recommendation,
-                    ams_action,
+                    sms.reorder_recommendation,
+                    sms.ams_action,
 
                     -- UOM info
-                    order_uom, order_uom_desc, order_uom_rate,
-                    base_uom, base_uom_desc,
+                    sms.order_uom, sms.order_uom_desc, sms.order_uom_rate,
+                    sms.base_uom, sms.base_uom_desc,
 
                     -- Metadata
-                    last_updated,
-                    peak_months
-                FROM wms.stock_movement_summary
+                    sms.last_updated,
+                    sms.peak_months
+                FROM wms.stock_movement_summary sms
+                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id AND sc."AcStockUOMID" = ''
                 WHERE {where_clause}
                 ORDER BY
-                    CASE demand_pattern
+                    CASE sms.demand_pattern
                         WHEN 'STRONG_GROWTH' THEN 1
                         WHEN 'GROWTH' THEN 2
                         WHEN 'STABLE' THEN 3
@@ -3893,14 +3912,19 @@ async def get_sku_intelligence(
                         WHEN 'DEAD' THEN 9
                         ELSE 10
                     END,
-                    current_balance DESC NULLS LAST
+                    sms.current_balance DESC NULLS LAST
                 LIMIT ${param_idx} OFFSET ${param_idx + 1}
             """
 
             rows = await conn.fetch(query, *params)
 
-            # Get total count (with current filters, excluding reorder_recommendation filter for summary)
-            count_query = f"SELECT COUNT(*) FROM wms.stock_movement_summary WHERE {where_clause}"
+            # Get total count (with current filters)
+            count_query = f"""
+                SELECT COUNT(*)
+                FROM wms.stock_movement_summary sms
+                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id AND sc."AcStockUOMID" = ''
+                WHERE {where_clause}
+            """
             total = await conn.fetchval(count_query, *params[:-2]) if params[:-2] else await conn.fetchval("SELECT COUNT(*) FROM wms.stock_movement_summary")
 
             # Get summary counts by reorder_recommendation (apply all filters EXCEPT reorder_recommendation)
@@ -3910,10 +3934,11 @@ async def get_sku_intelligence(
             summary_where = " AND ".join(summary_conditions) if summary_conditions else "TRUE"
 
             summary_query = f"""
-                SELECT reorder_recommendation, COUNT(*) as count
-                FROM wms.stock_movement_summary
+                SELECT sms.reorder_recommendation, COUNT(*) as count
+                FROM wms.stock_movement_summary sms
+                LEFT JOIN "AcStockCompany" sc ON sc."AcStockID" = sms.stock_id AND sc."AcStockUOMID" = ''
                 WHERE {summary_where}
-                GROUP BY reorder_recommendation
+                GROUP BY sms.reorder_recommendation
             """
             summary_rows = await conn.fetch(summary_query, *summary_params) if summary_params else await conn.fetch(summary_query)
             summary = {row['reorder_recommendation'] or 'UNKNOWN': row['count'] for row in summary_rows}
