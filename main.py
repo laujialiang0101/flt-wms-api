@@ -112,6 +112,18 @@ async def create_pool_with_retry():
 
 
 # Password hashing utilities (same as KPI tracker)
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt or fallback to SHA256."""
+    if BCRYPT_AVAILABLE:
+        salt = bcrypt.gensalt()
+        return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+    else:
+        # Fallback to SHA256 with a simple salt
+        salt = secrets.token_hex(16)
+        hashed = hashlib.sha256((salt + password).encode()).hexdigest()
+        return f"sha256${salt}${hashed}"
+
+
 def verify_password(password: str, password_hash: str) -> bool:
     """Verify a password against its hash."""
     if BCRYPT_AVAILABLE and not password_hash.startswith('sha256$'):
@@ -197,6 +209,32 @@ async def health_check():
 # Same method as KPI Tracker - Staff ID + Password
 # ============================================================================
 
+# WMS Access Control by POS User Group
+# FULL: Can view all outlets and all data
+# REGION: Can view outlets they manage (allowed_outlets array)
+# OUTLET: Can view only their own outlet (primary_outlet)
+# NONE: Cannot login to WMS
+
+WMS_FULL_ACCESS_GROUPS = [
+    'ADMINISTRATORS', 'COO', 'CMO', 'CEO',      # Executive access
+    'PURCHASER', 'WAREHOUSE MANAGER',            # Operations access
+    'ONLINE EXECUTIVE',                          # Online operations
+]
+
+WMS_REGION_ACCESS_GROUPS = [
+    'AREA MANAGER',                              # Regional managers
+]
+
+WMS_OUTLET_ACCESS_GROUPS = [
+    'PIC OUTLET',                                # Outlet PICs
+]
+
+WMS_BLOCKED_GROUPS = [
+    'CASHIER', 'STAFF',                          # Front-line staff
+    'MARKETING EXECUTIVE',                       # Marketing team
+]
+
+
 class LoginRequest(BaseModel):
     staff_id: str
     password: str
@@ -207,14 +245,20 @@ async def login(request: LoginRequest):
     """
     Authenticate staff using staff_list_master + kpi_user_auth tables.
     Same authentication method as KPI Tracker.
-    Only administrators can access the WMS app.
+
+    Access Control by pos_user_group:
+    - FULL: ADMINISTRATORS, COO, CMO, CEO, PURCHASER, WAREHOUSE MANAGER, ONLINE EXECUTIVE
+    - REGION: AREA MANAGER (sees outlets in allowed_outlets)
+    - OUTLET: PIC OUTLET (sees only primary_outlet)
+    - BLOCKED: CASHIER, MARKETING EXECUTIVE (cannot login)
     """
     try:
         async with pool.acquire() as conn:
-            # Find staff by ID
+            # Find staff by ID with all necessary fields
             staff = await conn.fetchrow("""
-                SELECT staff_id, staff_name, role, is_active,
-                       primary_outlet, primary_outlet_name
+                SELECT staff_id, staff_name, role, pos_user_group, is_active,
+                       primary_outlet, primary_outlet_name,
+                       allowed_outlets, allowed_outlet_names, region
                 FROM kpi.staff_list_master
                 WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
             """, request.staff_id)
@@ -222,11 +266,21 @@ async def login(request: LoginRequest):
             if not staff:
                 raise HTTPException(status_code=401, detail="Staff ID not found or inactive")
 
-            # Check if admin role
-            if staff['role'].lower() != 'admin':
+            # Get pos_user_group (normalize to uppercase for comparison)
+            pos_group = (staff['pos_user_group'] or '').upper().strip()
+
+            # Determine WMS access level based on pos_user_group
+            if pos_group in [g.upper() for g in WMS_FULL_ACCESS_GROUPS]:
+                wms_access = 'FULL'
+            elif pos_group in [g.upper() for g in WMS_REGION_ACCESS_GROUPS]:
+                wms_access = 'REGION'
+            elif pos_group in [g.upper() for g in WMS_OUTLET_ACCESS_GROUPS]:
+                wms_access = 'OUTLET'
+            else:
+                # Block access for CASHIER, MARKETING EXECUTIVE, and any unknown groups
                 raise HTTPException(
                     status_code=403,
-                    detail=f"Access denied. Only administrators can access WMS. Your role: {staff['role']}"
+                    detail=f"Access denied. Your role ({staff['pos_user_group']}) does not have WMS access."
                 )
 
             # Verify password from kpi_user_auth (same table as KPI Tracker)
@@ -235,15 +289,32 @@ async def login(request: LoginRequest):
             """, request.staff_id)
 
             if not kpi_auth:
-                # First-time login - user needs to set password in KPI Tracker first
-                raise HTTPException(
-                    status_code=401,
-                    detail="Password not set. Please login to KPI Tracker first to set your password."
-                )
+                # First-time login - user needs to set password
+                return {
+                    "success": False,
+                    "needs_password_setup": True,
+                    "user": {
+                        "staff_id": staff['staff_id'],
+                        "name": staff['staff_name'],
+                        "pos_user_group": staff['pos_user_group']
+                    },
+                    "error": "First-time login. Please set your password."
+                }
 
             # Verify password
             if not verify_password(request.password, kpi_auth['password_hash']):
                 raise HTTPException(status_code=401, detail="Invalid password")
+
+            # Build allowed outlets list based on access level
+            if wms_access == 'FULL':
+                # Full access users can see all outlets (frontend will fetch dynamically)
+                allowed_outlets = None  # None means "all"
+            elif wms_access == 'REGION':
+                # Region access uses allowed_outlets array from staff record
+                allowed_outlets = list(staff['allowed_outlets']) if staff['allowed_outlets'] else []
+            else:
+                # Outlet access only sees primary_outlet
+                allowed_outlets = [staff['primary_outlet']] if staff['primary_outlet'] else []
 
             return {
                 "success": True,
@@ -251,8 +322,12 @@ async def login(request: LoginRequest):
                     "staff_id": staff['staff_id'],
                     "name": staff['staff_name'],
                     "role": staff['role'],
+                    "pos_user_group": staff['pos_user_group'],
+                    "wms_access": wms_access,
                     "outlet": staff['primary_outlet'],
-                    "outlet_name": staff['primary_outlet_name']
+                    "outlet_name": staff['primary_outlet_name'],
+                    "allowed_outlets": allowed_outlets,
+                    "region": staff['region']
                 }
             }
 
@@ -260,6 +335,71 @@ async def login(request: LoginRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Login error: {str(e)}")
+
+
+class SetPasswordRequest(BaseModel):
+    staff_id: str
+    new_password: str
+
+
+@app.post("/api/v1/auth/set-password")
+async def set_password(request: SetPasswordRequest):
+    """Set password for first-time WMS login.
+
+    Only works for users who:
+    1. Exist in kpi.staff_list_master
+    2. Have WMS access (not CASHIER/MARKETING EXECUTIVE)
+    3. Haven't set a password yet
+    """
+    try:
+        # Validate password requirements
+        if len(request.new_password) < 4:
+            return {"success": False, "error": "Password must be at least 4 characters"}
+
+        async with pool.acquire() as conn:
+            # Verify user exists and has WMS access
+            staff = await conn.fetchrow("""
+                SELECT staff_id, staff_name, pos_user_group
+                FROM kpi.staff_list_master
+                WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
+            """, request.staff_id)
+
+            if not staff:
+                return {"success": False, "error": "User not found or inactive"}
+
+            # Check WMS access permission
+            pos_group = (staff['pos_user_group'] or '').upper().strip()
+            has_access = (
+                pos_group in [g.upper() for g in WMS_FULL_ACCESS_GROUPS] or
+                pos_group in [g.upper() for g in WMS_REGION_ACCESS_GROUPS] or
+                pos_group in [g.upper() for g in WMS_OUTLET_ACCESS_GROUPS]
+            )
+
+            if not has_access:
+                return {"success": False, "error": f"Your role ({staff['pos_user_group']}) does not have WMS access"}
+
+            # Check if password already set
+            existing = await conn.fetchrow("""
+                SELECT code FROM kpi_user_auth WHERE UPPER(code) = UPPER($1)
+            """, request.staff_id)
+
+            if existing:
+                return {"success": False, "error": "Password already set. Please login with your existing password."}
+
+            # Hash and store the password
+            password_hash = hash_password(request.new_password)
+            await conn.execute("""
+                INSERT INTO kpi_user_auth (code, password_hash, created_at)
+                VALUES ($1, $2, CURRENT_TIMESTAMP)
+            """, staff['staff_id'], password_hash)
+
+            return {
+                "success": True,
+                "message": "Password set successfully. You can now login."
+            }
+
+    except Exception as e:
+        return {"success": False, "error": f"Failed to set password: {str(e)}"}
 
 
 # ============================================================================
@@ -4053,20 +4193,21 @@ async def get_outlets_for_user(
     api_key: str = Query(...),
     staff_id: str = Query(..., description="Staff ID for role-based filtering")
 ):
-    """Get list of outlets accessible by the user based on their role.
+    """Get list of outlets accessible by the user based on their pos_user_group.
 
-    Access Control:
-    - Staff/PIC: Only their primary_outlet
-    - Area Manager: All outlets in allowed_outlets array
-    - Admin/COO/CMO: All outlets
+    Access Control (aligned with login):
+    - FULL: ADMINISTRATORS, COO, CMO, CEO, PURCHASER, WAREHOUSE MANAGER, ONLINE EXECUTIVE -> All outlets
+    - REGION: AREA MANAGER -> Outlets in allowed_outlets array
+    - OUTLET: PIC OUTLET -> Only their primary_outlet
     """
     verify_api_key(api_key)
 
     try:
         async with pool.acquire() as conn:
-            # Get user's role and outlet assignments
+            # Get user's pos_user_group and outlet assignments
             staff = await conn.fetchrow("""
-                SELECT role, primary_outlet, primary_outlet_name, allowed_outlets, allowed_outlet_names, region
+                SELECT role, pos_user_group, primary_outlet, primary_outlet_name,
+                       allowed_outlets, allowed_outlet_names, region
                 FROM kpi.staff_list_master
                 WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
             """, staff_id)
@@ -4074,11 +4215,13 @@ async def get_outlets_for_user(
             if not staff:
                 raise HTTPException(status_code=404, detail="Staff not found or inactive")
 
-            role = staff['role'].lower() if staff['role'] else 'staff'
+            pos_group = (staff['pos_user_group'] or '').upper().strip()
             outlets = []
 
-            if role in ('admin', 'coo', 'cmo', 'director'):
-                # Admin can see all outlets
+            # Determine access level using same logic as login
+            if pos_group in [g.upper() for g in WMS_FULL_ACCESS_GROUPS]:
+                wms_access = 'FULL'
+                # Full access can see all outlets
                 rows = await conn.fetch("""
                     SELECT DISTINCT location_id as id, location_name as name
                     FROM wms.stock_movement_by_location
@@ -4086,19 +4229,25 @@ async def get_outlets_for_user(
                     ORDER BY location_name
                 """)
                 outlets = [dict(row) for row in rows]
-            elif role == 'area_manager':
-                # Area manager sees outlets in their region
+            elif pos_group in [g.upper() for g in WMS_REGION_ACCESS_GROUPS]:
+                wms_access = 'REGION'
+                # Area manager sees outlets in their allowed_outlets
                 allowed = staff['allowed_outlets'] or []
                 names = staff['allowed_outlet_names'] or []
                 outlets = [{'id': id, 'name': name} for id, name in zip(allowed, names)]
-            else:
-                # Regular staff sees only their outlet
+            elif pos_group in [g.upper() for g in WMS_OUTLET_ACCESS_GROUPS]:
+                wms_access = 'OUTLET'
+                # PIC sees only their outlet
                 if staff['primary_outlet']:
                     outlets = [{'id': staff['primary_outlet'], 'name': staff['primary_outlet_name']}]
+            else:
+                wms_access = 'NONE'
+                # Should not reach here if login is working correctly
 
             return {
                 "status": "success",
-                "role": role,
+                "pos_user_group": staff['pos_user_group'],
+                "wms_access": wms_access,
                 "region": staff['region'],
                 "outlets": outlets
             }
