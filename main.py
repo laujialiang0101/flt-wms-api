@@ -4813,6 +4813,488 @@ async def get_cross_outlet_recommendations(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/analytics/stock-rotation")
+async def get_stock_rotation_recommendations(
+    api_key: str = Query(...),
+    outlet_id: str = Query(..., description="Target outlet ID (view transfers TO/FROM this outlet)"),
+    staff_id: str = Query(..., description="Staff ID to determine access level"),
+    direction: str = Query(default="both", description="'in' = transfers INTO outlet, 'out' = transfers OUT, 'both' = all"),
+    limit: int = Query(default=100, le=500)
+):
+    """Get stock rotation recommendations - match overstocked outlets with understocked outlets.
+
+    Purpose: Inter-outlet stock transfer to minimize wastage and improve cash flow.
+
+    Logic:
+    - TRANSFER OUT: Items overstocked at this outlet that are understocked elsewhere
+    - TRANSFER IN: Items understocked at this outlet that are overstocked elsewhere
+
+    TIERED OVERSTOCKED DETECTION (data-driven thresholds):
+    =========================================================
+    Based on actual data analysis of 166,000+ outlet-SKU combinations:
+
+    VELOCITY TIERS (based on AMS in order UOM):
+    - FAST (AMS >= 50):      DOI > 45 days,  Excess > 0.5× AMS
+    - MEDIUM (AMS 10-50):    DOI > 75 days,  Excess > 1× AMS
+    - SLOW (AMS 1-10):       DOI > 120 days, Excess > 2× AMS
+    - VERY_SLOW (AMS < 1):   DOI > 180 days, Excess > 3× AMS or 5 units
+
+    DEMAND PATTERN MODIFIERS:
+    - DECLINING patterns: Reduce DOI threshold by 30 days (rotate out faster)
+    - GROWING patterns: Increase DOI threshold by 30 days (keep buffer)
+    - SPORADIC: Use VERY_SLOW thresholds + 30 days extra tolerance
+
+    HOUSE BRAND (FLTHB):
+    - Add 60 days DOI tolerance (longer lead times)
+    - Minimum SLOW tier thresholds
+
+    Prioritized by: transfer quantity (impact), then DOI difference (urgency)
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Verify user access
+            staff = await conn.fetchrow("""
+                SELECT role, region, allowed_outlets, pos_user_group
+                FROM kpi.staff_list_master
+                WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
+            """, staff_id)
+
+            if not staff:
+                raise HTTPException(status_code=404, detail="Staff not found")
+
+            role = (staff['role'] or '').lower()
+            pos_group = (staff['pos_user_group'] or '').upper().strip()
+
+            # Check access - only admin/manager roles can see rotation
+            has_access = (
+                role in ('admin', 'coo', 'cmo', 'director', 'area_manager') or
+                pos_group in ('ADMINISTRATORS', 'COO', 'CMO', 'CEO', 'PURCHASER', 'WAREHOUSE MANAGER', 'AREA MANAGER')
+            )
+
+            if not has_access:
+                return {
+                    "status": "success",
+                    "outlet_id": outlet_id,
+                    "message": "Stock rotation recommendations require manager access",
+                    "transfers_out": [],
+                    "transfers_in": [],
+                    "summary": {"total_out": 0, "total_in": 0, "total_transfer_opportunities": 0}
+                }
+
+            transfers_out = []
+            transfers_in = []
+
+            # ============================================================
+            # TRANSFERS OUT: This outlet is OVERSTOCKED, others need stock
+            # Uses TIERED logic based on velocity + demand pattern
+            # ============================================================
+            if direction in ('out', 'both'):
+                out_query = """
+                    WITH this_outlet_with_tiers AS (
+                        -- Calculate tiered thresholds for THIS outlet's items
+                        SELECT
+                            sml.stock_id,
+                            sml.current_balance,
+                            sml.ams_calculated,
+                            sml.days_of_inventory,
+                            COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1) as order_uom_rate,
+                            COALESCE(sms.demand_pattern, 'STABLE') as demand_pattern,
+                            COALESCE(sms.ud1_code, '') as ud1_code,
+
+                            -- Velocity tier (based on AMS in order UOM)
+                            CASE
+                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 50 THEN 'FAST'
+                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 10 THEN 'MEDIUM'
+                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 1 THEN 'SLOW'
+                                ELSE 'VERY_SLOW'
+                            END as velocity_tier,
+
+                            -- Pattern category for modifiers
+                            CASE
+                                WHEN COALESCE(sms.demand_pattern, 'STABLE') IN ('EXTREME_DECLINE', 'STRONG_DECLINE', 'DECLINE') THEN 'DECLINING'
+                                WHEN COALESCE(sms.demand_pattern, 'STABLE') IN ('EXTREME_GROWTH', 'STRONG_GROWTH', 'MODERATE_GROWTH', 'GROWTH', 'EMERGING_GROWTH') THEN 'GROWING'
+                                WHEN COALESCE(sms.demand_pattern, 'STABLE') = 'SPORADIC' THEN 'SPORADIC'
+                                ELSE 'STABLE'
+                            END as pattern_category,
+
+                            -- Is house brand?
+                            CASE WHEN COALESCE(sms.ud1_code, '') = 'FLTHB' THEN true ELSE false END as is_house_brand
+
+                        FROM wms.stock_movement_by_location sml
+                        LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                        WHERE sml.location_id = $1
+                          AND sml.current_balance > 0
+                          AND sml.ams_calculated > 0
+                    ),
+                    this_outlet_excess AS (
+                        -- Apply tiered thresholds to identify overstocked items
+                        SELECT
+                            t.*,
+
+                            -- Calculate DOI threshold based on velocity + pattern + house brand
+                            CASE
+                                -- SPORADIC: Always use highest tolerance (210 days)
+                                WHEN t.pattern_category = 'SPORADIC' THEN 210
+
+                                -- FAST tier base: 45 days
+                                WHEN t.velocity_tier = 'FAST' THEN
+                                    CASE
+                                        WHEN t.is_house_brand THEN GREATEST(120, 45 + 60)  -- House brand minimum SLOW + 60
+                                        WHEN t.pattern_category = 'DECLINING' THEN GREATEST(15, 45 - 30)
+                                        WHEN t.pattern_category = 'GROWING' THEN 45 + 30
+                                        ELSE 45
+                                    END
+
+                                -- MEDIUM tier base: 75 days
+                                WHEN t.velocity_tier = 'MEDIUM' THEN
+                                    CASE
+                                        WHEN t.is_house_brand THEN GREATEST(120, 75 + 60)
+                                        WHEN t.pattern_category = 'DECLINING' THEN 75 - 30
+                                        WHEN t.pattern_category = 'GROWING' THEN 75 + 30
+                                        ELSE 75
+                                    END
+
+                                -- SLOW tier base: 120 days
+                                WHEN t.velocity_tier = 'SLOW' THEN
+                                    CASE
+                                        WHEN t.is_house_brand THEN 120 + 60
+                                        WHEN t.pattern_category = 'DECLINING' THEN 120 - 30
+                                        WHEN t.pattern_category = 'GROWING' THEN 120 + 30
+                                        ELSE 120
+                                    END
+
+                                -- VERY_SLOW tier base: 180 days
+                                ELSE
+                                    CASE
+                                        WHEN t.is_house_brand THEN 180 + 60
+                                        WHEN t.pattern_category = 'DECLINING' THEN 180 - 30
+                                        WHEN t.pattern_category = 'GROWING' THEN 180 + 30
+                                        ELSE 180
+                                    END
+                            END as doi_threshold,
+
+                            -- Calculate excess threshold (in months of AMS)
+                            CASE
+                                -- SPORADIC: 4x AMS
+                                WHEN t.pattern_category = 'SPORADIC' THEN 4.0
+
+                                -- FAST tier
+                                WHEN t.velocity_tier = 'FAST' THEN
+                                    CASE
+                                        WHEN t.pattern_category = 'DECLINING' THEN 0.5
+                                        WHEN t.pattern_category = 'GROWING' THEN 1.0
+                                        ELSE 0.5
+                                    END
+
+                                -- MEDIUM tier
+                                WHEN t.velocity_tier = 'MEDIUM' THEN
+                                    CASE
+                                        WHEN t.pattern_category = 'DECLINING' THEN 0.5
+                                        WHEN t.pattern_category = 'GROWING' THEN 1.5
+                                        ELSE 1.0
+                                    END
+
+                                -- SLOW tier
+                                WHEN t.velocity_tier = 'SLOW' THEN
+                                    CASE
+                                        WHEN t.pattern_category = 'DECLINING' THEN 1.5
+                                        WHEN t.pattern_category = 'GROWING' THEN 2.5
+                                        ELSE 2.0
+                                    END
+
+                                -- VERY_SLOW tier
+                                ELSE
+                                    CASE
+                                        WHEN t.pattern_category = 'DECLINING' THEN 2.5
+                                        WHEN t.pattern_category = 'GROWING' THEN 3.5
+                                        ELSE 3.0
+                                    END
+                            END as excess_months_threshold,
+
+                            -- Target stock level = DOI threshold equivalent in units
+                            -- Excess = current - target
+                            t.current_balance - (t.ams_calculated *
+                                CASE
+                                    WHEN t.pattern_category = 'SPORADIC' THEN 4.0
+                                    WHEN t.velocity_tier = 'FAST' THEN
+                                        CASE WHEN t.pattern_category = 'GROWING' THEN 1.0 ELSE 0.5 END
+                                    WHEN t.velocity_tier = 'MEDIUM' THEN
+                                        CASE WHEN t.pattern_category = 'DECLINING' THEN 0.5 WHEN t.pattern_category = 'GROWING' THEN 1.5 ELSE 1.0 END
+                                    WHEN t.velocity_tier = 'SLOW' THEN
+                                        CASE WHEN t.pattern_category = 'DECLINING' THEN 1.5 WHEN t.pattern_category = 'GROWING' THEN 2.5 ELSE 2.0 END
+                                    ELSE
+                                        CASE WHEN t.pattern_category = 'DECLINING' THEN 2.5 WHEN t.pattern_category = 'GROWING' THEN 3.5 ELSE 3.0 END
+                                END
+                            ) as raw_excess_qty
+
+                        FROM this_outlet_with_tiers t
+                    ),
+                    filtered_excess AS (
+                        -- Filter to only items that exceed their tiered thresholds
+                        SELECT
+                            e.*,
+                            -- For VERY_SLOW, minimum excess is 5 units (regardless of AMS calculation)
+                            CASE
+                                WHEN e.velocity_tier = 'VERY_SLOW' THEN GREATEST(e.raw_excess_qty, 0)
+                                ELSE GREATEST(e.raw_excess_qty, 0)
+                            END as excess_qty
+                        FROM this_outlet_excess e
+                        WHERE e.days_of_inventory > e.doi_threshold
+                          AND (
+                              -- For VERY_SLOW: excess > threshold OR excess > 5 units
+                              (e.velocity_tier = 'VERY_SLOW' AND (e.raw_excess_qty > e.ams_calculated * e.excess_months_threshold OR e.raw_excess_qty > 5))
+                              -- For other tiers: excess > threshold
+                              OR (e.velocity_tier != 'VERY_SLOW' AND e.raw_excess_qty > e.ams_calculated * e.excess_months_threshold)
+                          )
+                    ),
+                    other_outlets_need AS (
+                        -- Items understocked at OTHER outlets
+                        SELECT
+                            sml.stock_id,
+                            sml.location_id,
+                            sml.location_name,
+                            sml.current_balance as their_balance,
+                            sml.ams_calculated as their_ams,
+                            sml.days_of_inventory as their_doi,
+                            -- Need = 2 months coverage - current
+                            GREATEST(0, (COALESCE(sml.ams_calculated, 0) * 2) - sml.current_balance) as need_qty
+                        FROM wms.stock_movement_by_location sml
+                        WHERE sml.location_id != $1
+                          AND sml.reorder_recommendation IN ('STOCKOUT', 'ORDER_NOW', 'ORDER_SOON')
+                          AND sml.ams_calculated > 0
+                    )
+                    SELECT
+                        e.stock_id,
+                        COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
+                        sms.order_uom,
+                        sms.ud1_code,
+                        e.demand_pattern,
+                        e.velocity_tier,
+                        e.pattern_category,
+                        e.doi_threshold,
+                        $1 as from_outlet,
+                        (SELECT location_name FROM wms.stock_movement_by_location WHERE location_id = $1 LIMIT 1) as from_outlet_name,
+                        n.location_id as to_outlet,
+                        n.location_name as to_outlet_name,
+                        ROUND(e.days_of_inventory, 0) as from_doi,
+                        ROUND(n.their_doi, 0) as to_doi,
+                        ROUND(e.current_balance / NULLIF(e.order_uom_rate, 0), 0) as from_balance_order_uom,
+                        ROUND(n.their_balance / NULLIF(e.order_uom_rate, 0), 0) as to_balance_order_uom,
+                        -- Transfer qty = MIN(excess, need), in ORDER UOM
+                        ROUND(LEAST(e.excess_qty, n.need_qty) / NULLIF(e.order_uom_rate, 0), 0) as transfer_qty,
+                        ROUND(e.excess_qty / NULLIF(e.order_uom_rate, 0), 0) as excess_qty_order_uom,
+                        ROUND(n.need_qty / NULLIF(e.order_uom_rate, 0), 0) as need_qty_order_uom,
+                        'EXCESS_TO_NEED' as transfer_reason
+                    FROM filtered_excess e
+                    JOIN other_outlets_need n ON e.stock_id = n.stock_id
+                    LEFT JOIN wms.stock_movement_summary sms ON e.stock_id = sms.stock_id
+                    WHERE e.excess_qty > 0 AND n.need_qty > 0
+                    ORDER BY LEAST(e.excess_qty, n.need_qty) DESC, (e.days_of_inventory - n.their_doi) DESC
+                    LIMIT $2
+                """
+                out_rows = await conn.fetch(out_query, outlet_id, limit)
+                transfers_out = [dict(row) for row in out_rows]
+
+            # ============================================================
+            # TRANSFERS IN: This outlet NEEDS stock, others have excess
+            # Uses TIERED logic for source outlet excess detection
+            # ============================================================
+            if direction in ('in', 'both'):
+                in_query = """
+                    WITH this_outlet_need AS (
+                        -- Items understocked at THIS outlet
+                        SELECT
+                            sml.stock_id,
+                            sml.current_balance,
+                            sml.ams_calculated,
+                            sml.days_of_inventory,
+                            COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1) as order_uom_rate,
+                            -- Need = 2 months coverage - current
+                            GREATEST(0, (COALESCE(sml.ams_calculated, 0) * 2) - sml.current_balance) as need_qty
+                        FROM wms.stock_movement_by_location sml
+                        LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                        WHERE sml.location_id = $1
+                          AND sml.reorder_recommendation IN ('STOCKOUT', 'ORDER_NOW', 'ORDER_SOON')
+                          AND sml.ams_calculated > 0
+                    ),
+                    other_outlets_with_tiers AS (
+                        -- Calculate tiered thresholds for OTHER outlets' items
+                        SELECT
+                            sml.stock_id,
+                            sml.location_id,
+                            sml.location_name,
+                            sml.current_balance as their_balance,
+                            sml.ams_calculated as their_ams,
+                            sml.days_of_inventory as their_doi,
+                            COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1) as order_uom_rate,
+                            COALESCE(sms.demand_pattern, 'STABLE') as demand_pattern,
+                            COALESCE(sms.ud1_code, '') as ud1_code,
+
+                            -- Velocity tier
+                            CASE
+                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 50 THEN 'FAST'
+                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 10 THEN 'MEDIUM'
+                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 1 THEN 'SLOW'
+                                ELSE 'VERY_SLOW'
+                            END as velocity_tier,
+
+                            -- Pattern category
+                            CASE
+                                WHEN COALESCE(sms.demand_pattern, 'STABLE') IN ('EXTREME_DECLINE', 'STRONG_DECLINE', 'DECLINE') THEN 'DECLINING'
+                                WHEN COALESCE(sms.demand_pattern, 'STABLE') IN ('EXTREME_GROWTH', 'STRONG_GROWTH', 'MODERATE_GROWTH', 'GROWTH', 'EMERGING_GROWTH') THEN 'GROWING'
+                                WHEN COALESCE(sms.demand_pattern, 'STABLE') = 'SPORADIC' THEN 'SPORADIC'
+                                ELSE 'STABLE'
+                            END as pattern_category,
+
+                            -- Is house brand?
+                            CASE WHEN COALESCE(sms.ud1_code, '') = 'FLTHB' THEN true ELSE false END as is_house_brand
+
+                        FROM wms.stock_movement_by_location sml
+                        LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                        WHERE sml.location_id != $1
+                          AND sml.current_balance > 0
+                          AND sml.ams_calculated > 0
+                    ),
+                    other_outlets_excess AS (
+                        -- Apply tiered thresholds
+                        SELECT
+                            t.*,
+
+                            -- DOI threshold
+                            CASE
+                                WHEN t.pattern_category = 'SPORADIC' THEN 210
+                                WHEN t.velocity_tier = 'FAST' THEN
+                                    CASE
+                                        WHEN t.is_house_brand THEN GREATEST(120, 45 + 60)
+                                        WHEN t.pattern_category = 'DECLINING' THEN GREATEST(15, 45 - 30)
+                                        WHEN t.pattern_category = 'GROWING' THEN 45 + 30
+                                        ELSE 45
+                                    END
+                                WHEN t.velocity_tier = 'MEDIUM' THEN
+                                    CASE
+                                        WHEN t.is_house_brand THEN GREATEST(120, 75 + 60)
+                                        WHEN t.pattern_category = 'DECLINING' THEN 75 - 30
+                                        WHEN t.pattern_category = 'GROWING' THEN 75 + 30
+                                        ELSE 75
+                                    END
+                                WHEN t.velocity_tier = 'SLOW' THEN
+                                    CASE
+                                        WHEN t.is_house_brand THEN 120 + 60
+                                        WHEN t.pattern_category = 'DECLINING' THEN 120 - 30
+                                        WHEN t.pattern_category = 'GROWING' THEN 120 + 30
+                                        ELSE 120
+                                    END
+                                ELSE
+                                    CASE
+                                        WHEN t.is_house_brand THEN 180 + 60
+                                        WHEN t.pattern_category = 'DECLINING' THEN 180 - 30
+                                        WHEN t.pattern_category = 'GROWING' THEN 180 + 30
+                                        ELSE 180
+                                    END
+                            END as doi_threshold,
+
+                            -- Excess months threshold
+                            CASE
+                                WHEN t.pattern_category = 'SPORADIC' THEN 4.0
+                                WHEN t.velocity_tier = 'FAST' THEN
+                                    CASE WHEN t.pattern_category = 'DECLINING' THEN 0.5 WHEN t.pattern_category = 'GROWING' THEN 1.0 ELSE 0.5 END
+                                WHEN t.velocity_tier = 'MEDIUM' THEN
+                                    CASE WHEN t.pattern_category = 'DECLINING' THEN 0.5 WHEN t.pattern_category = 'GROWING' THEN 1.5 ELSE 1.0 END
+                                WHEN t.velocity_tier = 'SLOW' THEN
+                                    CASE WHEN t.pattern_category = 'DECLINING' THEN 1.5 WHEN t.pattern_category = 'GROWING' THEN 2.5 ELSE 2.0 END
+                                ELSE
+                                    CASE WHEN t.pattern_category = 'DECLINING' THEN 2.5 WHEN t.pattern_category = 'GROWING' THEN 3.5 ELSE 3.0 END
+                            END as excess_months_threshold,
+
+                            -- Raw excess calculation
+                            t.their_balance - (t.their_ams *
+                                CASE
+                                    WHEN t.pattern_category = 'SPORADIC' THEN 4.0
+                                    WHEN t.velocity_tier = 'FAST' THEN
+                                        CASE WHEN t.pattern_category = 'GROWING' THEN 1.0 ELSE 0.5 END
+                                    WHEN t.velocity_tier = 'MEDIUM' THEN
+                                        CASE WHEN t.pattern_category = 'DECLINING' THEN 0.5 WHEN t.pattern_category = 'GROWING' THEN 1.5 ELSE 1.0 END
+                                    WHEN t.velocity_tier = 'SLOW' THEN
+                                        CASE WHEN t.pattern_category = 'DECLINING' THEN 1.5 WHEN t.pattern_category = 'GROWING' THEN 2.5 ELSE 2.0 END
+                                    ELSE
+                                        CASE WHEN t.pattern_category = 'DECLINING' THEN 2.5 WHEN t.pattern_category = 'GROWING' THEN 3.5 ELSE 3.0 END
+                                END
+                            ) as raw_excess_qty
+
+                        FROM other_outlets_with_tiers t
+                    ),
+                    filtered_other_excess AS (
+                        -- Filter to items exceeding tiered thresholds
+                        SELECT
+                            e.*,
+                            GREATEST(e.raw_excess_qty, 0) as excess_qty
+                        FROM other_outlets_excess e
+                        WHERE e.their_doi > e.doi_threshold
+                          AND (
+                              (e.velocity_tier = 'VERY_SLOW' AND (e.raw_excess_qty > e.their_ams * e.excess_months_threshold OR e.raw_excess_qty > 5))
+                              OR (e.velocity_tier != 'VERY_SLOW' AND e.raw_excess_qty > e.their_ams * e.excess_months_threshold)
+                          )
+                    )
+                    SELECT
+                        n.stock_id,
+                        COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
+                        sms.order_uom,
+                        sms.ud1_code,
+                        sms.demand_pattern,
+                        e.velocity_tier,
+                        e.pattern_category,
+                        e.doi_threshold,
+                        e.location_id as from_outlet,
+                        e.location_name as from_outlet_name,
+                        $1 as to_outlet,
+                        (SELECT location_name FROM wms.stock_movement_by_location WHERE location_id = $1 LIMIT 1) as to_outlet_name,
+                        ROUND(e.their_doi, 0) as from_doi,
+                        ROUND(n.days_of_inventory, 0) as to_doi,
+                        ROUND(e.their_balance / NULLIF(n.order_uom_rate, 0), 0) as from_balance_order_uom,
+                        ROUND(n.current_balance / NULLIF(n.order_uom_rate, 0), 0) as to_balance_order_uom,
+                        -- Transfer qty = MIN(excess, need), in ORDER UOM
+                        ROUND(LEAST(e.excess_qty, n.need_qty) / NULLIF(n.order_uom_rate, 0), 0) as transfer_qty,
+                        ROUND(e.excess_qty / NULLIF(n.order_uom_rate, 0), 0) as excess_qty_order_uom,
+                        ROUND(n.need_qty / NULLIF(n.order_uom_rate, 0), 0) as need_qty_order_uom,
+                        'NEED_FROM_EXCESS' as transfer_reason
+                    FROM this_outlet_need n
+                    JOIN filtered_other_excess e ON n.stock_id = e.stock_id
+                    LEFT JOIN wms.stock_movement_summary sms ON n.stock_id = sms.stock_id
+                    WHERE n.need_qty > 0 AND e.excess_qty > 0
+                    ORDER BY LEAST(e.excess_qty, n.need_qty) DESC, (e.their_doi - n.days_of_inventory) DESC
+                    LIMIT $2
+                """
+                in_rows = await conn.fetch(in_query, outlet_id, limit)
+                transfers_in = [dict(row) for row in in_rows]
+
+            # Get outlet name
+            outlet_name_row = await conn.fetchrow("""
+                SELECT DISTINCT location_name FROM wms.stock_movement_by_location
+                WHERE location_id = $1 LIMIT 1
+            """, outlet_id)
+            outlet_name = outlet_name_row['location_name'] if outlet_name_row else outlet_id
+
+            return {
+                "status": "success",
+                "outlet_id": outlet_id,
+                "outlet_name": outlet_name,
+                "direction": direction,
+                "transfers_out": transfers_out,
+                "transfers_in": transfers_in,
+                "summary": {
+                    "total_out": len(transfers_out),
+                    "total_in": len(transfers_in),
+                    "total_transfer_opportunities": len(transfers_out) + len(transfers_in)
+                }
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8002)
