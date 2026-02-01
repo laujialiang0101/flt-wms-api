@@ -3405,6 +3405,11 @@ async def refresh_stock_movement(api_key: str = Query(...)):
             """, timeout=600)
             steps_completed.append("insert")
 
+            # Clean up temp tables - these are no longer needed after insert
+            await conn.execute("DROP TABLE IF EXISTS wms.temp_sales_agg CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS wms.temp_cv CASCADE")
+            steps_completed.append("cleanup_temp")
+
             # Get summary
             summary = await conn.fetchrow("""
                 SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE trend_status = 'SPIKE_UP') as spike_up,
@@ -3429,6 +3434,13 @@ async def refresh_stock_movement(api_key: str = Query(...)):
             }
     except Exception as e:
         import traceback
+        # Clean up temp tables on failure to prevent stale data accumulation
+        try:
+            async with pool.acquire() as cleanup_conn:
+                await cleanup_conn.execute("DROP TABLE IF EXISTS wms.temp_sales_agg CASCADE")
+                await cleanup_conn.execute("DROP TABLE IF EXISTS wms.temp_cv CASCADE")
+        except:
+            pass
         error_detail = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
         raise HTTPException(status_code=500, detail=error_detail)
 
