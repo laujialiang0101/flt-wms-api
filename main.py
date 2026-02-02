@@ -25,6 +25,32 @@ import asyncpg
 
 from expiry_endpoints import create_expiry_router
 
+# Reorder recommendation: DB values <-> Frontend display names
+# UNCERTAIN(REVIEW) + MONITOR(UNKNOWN) merged into single UNCERTAIN card
+_REORDER_DB_TO_DISPLAY = {
+    'DELIST_CANDIDATE': 'DELIST',
+    'STOP_ORDERING': 'OVERSTOCKED',
+    'REDUCE_ORDER': 'REDUCE',
+    'REVIEW': 'UNCERTAIN',
+    'UNKNOWN': 'UNCERTAIN',
+}
+_REORDER_DISPLAY_TO_DB = {
+    'DELIST': 'DELIST_CANDIDATE',
+    'OVERSTOCKED': 'STOP_ORDERING',
+    'REDUCE': 'REDUCE_ORDER',
+}
+
+def _translate_reorder_rows(rows):
+    """Translate DB reorder_recommendation values to frontend display names."""
+    data = []
+    for row in rows:
+        item = dict(row)
+        rec = item.get('reorder_recommendation')
+        if rec in _REORDER_DB_TO_DISPLAY:
+            item['reorder_recommendation'] = _REORDER_DB_TO_DISPLAY[rec]
+        data.append(item)
+    return data
+
 # Optional bcrypt for password hashing (same as KPI tracker)
 try:
     import bcrypt
@@ -3019,7 +3045,6 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
                     category VARCHAR(100),
                     brand VARCHAR(100),
                     ud1_code VARCHAR(50),
-                    ud2_suggested VARCHAR(10),
                     therapeutic_group VARCHAR(100),
                     product_family VARCHAR(100),
                     active_ingredient TEXT,
@@ -3071,10 +3096,6 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
                     suggested_reorder_qty NUMERIC,
 
                     has_house_brand_alt BOOLEAN DEFAULT FALSE,
-                    house_brand_stock_id VARCHAR(50),
-                    house_brand_name VARCHAR(200),
-                    house_brand_gp_margin NUMERIC,
-                    margin_opportunity_monthly NUMERIC,
 
                     base_uom VARCHAR(20),
                     base_uom_desc VARCHAR(50),
@@ -3940,6 +3961,15 @@ async def get_sku_intelligence(
     """
     verify_api_key(api_key)
 
+    # Translate filter value from frontend name to DB name
+    _uncertain_filter = False
+    if reorder_recommendation and reorder_recommendation in _REORDER_DISPLAY_TO_DB:
+        reorder_recommendation = _REORDER_DISPLAY_TO_DB[reorder_recommendation]
+    elif reorder_recommendation == 'UNCERTAIN':
+        # UNCERTAIN maps to both REVIEW and UNKNOWN in DB
+        reorder_recommendation = None  # handled below as special case
+        _uncertain_filter = True
+
     try:
         async with pool.acquire() as conn:
             # Build WHERE clause
@@ -3967,7 +3997,9 @@ async def get_sku_intelligence(
                 params.append(seasonal_intensity)
                 param_idx += 1
 
-            if reorder_recommendation:
+            if _uncertain_filter:
+                conditions.append("sms.reorder_recommendation IN ('REVIEW', 'UNKNOWN')")
+            elif reorder_recommendation:
                 conditions.append(f"sms.reorder_recommendation = ${param_idx}")
                 params.append(reorder_recommendation)
                 param_idx += 1
@@ -4091,12 +4123,14 @@ async def get_sku_intelligence(
             rows = await conn.fetch(query, *params)
 
             # Get total count (with current filters) - no JOIN needed
+            # Use where_clause check (not params) since some filters like is_active
+            # add literal conditions without parameterized values
             count_query = f"""
                 SELECT COUNT(*)
                 FROM wms.stock_movement_summary sms
                 WHERE {where_clause}
             """
-            total = await conn.fetchval(count_query, *params[:-2]) if params[:-2] else await conn.fetchval("SELECT COUNT(*) FROM wms.stock_movement_summary")
+            total = await conn.fetchval(count_query, *params[:-2])
 
             # Get summary counts by reorder_recommendation (apply all filters EXCEPT reorder_recommendation)
             # This gives us the true counts for the action cards
@@ -4111,7 +4145,11 @@ async def get_sku_intelligence(
                 GROUP BY sms.reorder_recommendation
             """
             summary_rows = await conn.fetch(summary_query, *summary_params) if summary_params else await conn.fetch(summary_query)
-            summary = {row['reorder_recommendation'] or 'UNKNOWN': row['count'] for row in summary_rows}
+            summary = {}
+            for row in summary_rows:
+                key = row['reorder_recommendation'] or 'UNKNOWN'
+                key = _REORDER_DB_TO_DISPLAY.get(key, key)
+                summary[key] = summary.get(key, 0) + row['count']
 
             # Get review summary counts (items needing attention) - no JOIN needed
             review_query = f"""
@@ -4142,7 +4180,7 @@ async def get_sku_intelligence(
                 "offset": offset,
                 "summary": summary,
                 "review_summary": review_summary,
-                "data": [dict(row) for row in rows]
+                "data": _translate_reorder_rows(rows)
             }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -4286,6 +4324,14 @@ async def get_outlet_sku_intelligence(
     """
     verify_api_key(api_key)
 
+    # Translate filter: frontend names -> DB names (same mapping as main endpoint)
+    _uncertain_filter = False
+    if reorder_recommendation and reorder_recommendation in _REORDER_DISPLAY_TO_DB:
+        reorder_recommendation = _REORDER_DISPLAY_TO_DB[reorder_recommendation]
+    elif reorder_recommendation == 'UNCERTAIN':
+        reorder_recommendation = None
+        _uncertain_filter = True
+
     try:
         async with pool.acquire() as conn:
             # Check if fast table exists (refreshed by sync service)
@@ -4312,14 +4358,16 @@ async def get_outlet_sku_intelligence(
                 """)
 
                 # Determine if we can use instant pagination (no filters + row_num exists)
-                has_filters = bool(reorder_recommendation or ud1_code or search)
+                has_filters = bool(reorder_recommendation or _uncertain_filter or ud1_code or search)
 
                 # Build WHERE clause
                 conditions = ["d.location_id = $1"]
                 params = [outlet_id]
                 param_idx = 2
 
-                if reorder_recommendation:
+                if _uncertain_filter:
+                    conditions.append("d.reorder_recommendation IN ('REVIEW', 'UNKNOWN')")
+                elif reorder_recommendation:
                     conditions.append(f"d.reorder_recommendation = ${param_idx}")
                     params.append(reorder_recommendation)
                     param_idx += 1
@@ -4440,7 +4488,7 @@ async def get_outlet_sku_intelligence(
                         'ORDER_SOON': summary_row['order_soon_count'],
                         'OPTIMAL': summary_row['optimal_count'],
                         'OVERSTOCKED': summary_row['overstocked_count'],
-                        'REVIEW': summary_row['review_count']
+                        'UNCERTAIN': summary_row['review_count']
                     }
                     if not has_filters:
                         # Use pre-computed total from summary table
@@ -4615,7 +4663,7 @@ async def get_outlet_sku_intelligence(
                     'ORDER_SOON': summary_row['order_soon_count'],
                     'OPTIMAL': summary_row['optimal_count'],
                     'OVERSTOCKED': summary_row['overstocked_count'],
-                    'REVIEW': summary_row['review_count']
+                    'UNCERTAIN': summary_row['review_count']
                 }
                 # Use pre-aggregated total when no filters applied
                 if not reorder_recommendation and not ud1_code and not search:
@@ -4646,7 +4694,11 @@ async def get_outlet_sku_intelligence(
                     GROUP BY reorder_recommendation
                 """
                 summary_rows = await conn.fetch(summary_query, outlet_id)
-                summary = {row['reorder_recommendation'] or 'REVIEW': row['count'] for row in summary_rows}
+                summary = {}
+                for row in summary_rows:
+                    key = row['reorder_recommendation'] or 'REVIEW'
+                    key = _REORDER_DB_TO_DISPLAY.get(key, key)
+                    summary[key] = summary.get(key, 0) + row['count']
 
             # Get review_summary from master SKU data for items in this outlet (slow path)
             review_summary_rows = await conn.fetch("""
@@ -4677,7 +4729,7 @@ async def get_outlet_sku_intelligence(
                 "offset": offset,
                 "summary": summary,
                 "review_summary": review_summary,
-                "data": [dict(row) for row in rows]
+                "data": _translate_reorder_rows(rows)
             }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
