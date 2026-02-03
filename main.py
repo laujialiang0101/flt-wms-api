@@ -5461,7 +5461,8 @@ async def get_purchase_orders(
                 params.append(rec)
                 param_idx += 1
             else:
-                conditions.append("sms.reorder_recommendation IN ('ORDER_NOW', 'ORDER_SOON', 'STOCKOUT')")
+                # Include OPTIMAL for proactive ordering (order up to target even when above reorder point)
+                conditions.append("sms.reorder_recommendation IN ('ORDER_NOW', 'ORDER_SOON', 'STOCKOUT', 'OPTIMAL')")
 
             # Must be active with valid order target
             conditions.append("sms.is_active = true")
