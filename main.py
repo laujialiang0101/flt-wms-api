@@ -3179,6 +3179,19 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='product_family') THEN
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN product_family VARCHAR(100);
                     END IF;
+                    -- Purchase Order pre-computed columns
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='po_supplier_id') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_supplier_id VARCHAR(50);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_supplier_source VARCHAR(20);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_barcode VARCHAR(50);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_barcode_source VARCHAR(20);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_unit_price NUMERIC;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_price_source VARCHAR(20);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_price_note TEXT;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN brand_description VARCHAR(200);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_data_updated_at TIMESTAMP;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_last_generated_at TIMESTAMP;
+                    END IF;
                 END $$;
             """)
 
@@ -3187,6 +3200,24 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_abc_xyz ON wms.stock_movement_summary (abc_xyz_class)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_trend ON wms.stock_movement_summary (trend_status)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_stockout ON wms.stock_movement_summary (stockout_risk)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_sms_po_supplier ON wms.stock_movement_summary (po_supplier_id)")
+
+            # Create PO generation log table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS wms.po_generation_log (
+                    po_id SERIAL PRIMARY KEY,
+                    supplier_id VARCHAR(50) NOT NULL,
+                    generated_at TIMESTAMP DEFAULT NOW(),
+                    generated_by VARCHAR(50),
+                    item_count INTEGER,
+                    total_value NUMERIC,
+                    total_qty INTEGER,
+                    items JSONB,
+                    location_id VARCHAR(20) DEFAULT 'WAREHOUSE'
+                )
+            """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_po_log_supplier ON wms.po_generation_log (supplier_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_po_log_date ON wms.po_generation_log (generated_at DESC)")
 
             return {"status": "success", "message": "wms.stock_movement_summary table created/updated"}
     except Exception as e:
@@ -3861,6 +3892,19 @@ async def setup_analytics(api_key: str = Query(...)):
                     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='product_family') THEN
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN product_family VARCHAR(100);
                     END IF;
+                    -- Purchase Order pre-computed columns
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='po_supplier_id') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_supplier_id VARCHAR(50);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_supplier_source VARCHAR(20);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_barcode VARCHAR(50);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_barcode_source VARCHAR(20);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_unit_price NUMERIC;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_price_source VARCHAR(20);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_price_note TEXT;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN brand_description VARCHAR(200);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_data_updated_at TIMESTAMP;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN po_last_generated_at TIMESTAMP;
+                    END IF;
                 END $$;
             """)
 
@@ -3868,6 +3912,24 @@ async def setup_analytics(api_key: str = Query(...)):
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_wms_seasonality ON wms.stock_movement_summary(seasonality_type)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_wms_velocity ON wms.stock_movement_summary(velocity_category)")
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_wms_recommendation ON wms.stock_movement_summary(reorder_recommendation)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_wms_po_supplier ON wms.stock_movement_summary(po_supplier_id)")
+
+            # Create PO generation log table
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS wms.po_generation_log (
+                    po_id SERIAL PRIMARY KEY,
+                    supplier_id VARCHAR(50) NOT NULL,
+                    generated_at TIMESTAMP DEFAULT NOW(),
+                    generated_by VARCHAR(50),
+                    item_count INTEGER,
+                    total_value NUMERIC,
+                    total_qty INTEGER,
+                    items JSONB,
+                    location_id VARCHAR(20) DEFAULT 'WAREHOUSE'
+                )
+            """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_po_log_supplier ON wms.po_generation_log (supplier_id)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_po_log_date ON wms.po_generation_log (generated_at DESC)")
 
             # Create view on AcStockBalanceDetail for monthly sales analysis
             await conn.execute("""
@@ -4100,7 +4162,10 @@ async def get_sku_intelligence(
                     sms.review_priority,
                     sms.reviewed_at,
                     sms.reviewed_by,
-                    sms.active_months
+                    sms.active_months,
+
+                    -- PO tracking
+                    sms.po_last_generated_at
                 FROM wms.stock_movement_summary sms
                 WHERE {where_clause}
                 ORDER BY
@@ -5355,6 +5420,294 @@ async def get_stock_rotation_recommendations(
             }
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========================================
+# Purchase Orders API
+# ========================================
+
+
+@app.get("/api/v1/analytics/purchase-orders")
+async def get_purchase_orders(
+    api_key: str = Query(...),
+    reorder_recommendation: Optional[str] = Query(default=None, description="Filter: ORDER_NOW, ORDER_SOON, STOCKOUT"),
+    supplier_id: Optional[str] = Query(default=None),
+    ud1_code: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+):
+    """Get purchase order data: orderable items grouped by supplier with pre-computed PO data.
+
+    Default: ORDER_NOW + ORDER_SOON + STOCKOUT items that are active with valid order_up_to_level.
+    Returns supplier summaries + all items with supplier, barcode, price, brand info.
+    Order qty = CEIL(order_up_to - balance_in_order_uom).
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            conditions = []
+            params = []
+            param_idx = 1
+
+            # Default: orderable items only
+            if reorder_recommendation:
+                # Map display names to DB names
+                rec = reorder_recommendation
+                if rec in _REORDER_DISPLAY_TO_DB:
+                    rec = _REORDER_DISPLAY_TO_DB[rec]
+                conditions.append(f"sms.reorder_recommendation = ${param_idx}")
+                params.append(rec)
+                param_idx += 1
+            else:
+                conditions.append("sms.reorder_recommendation IN ('ORDER_NOW', 'ORDER_SOON', 'STOCKOUT')")
+
+            # Must be active with valid order target
+            conditions.append("sms.is_active = true")
+            conditions.append("sms.order_up_to_level IS NOT NULL")
+            conditions.append("sms.order_up_to_level > 0")
+            conditions.append("sms.order_uom_rate IS NOT NULL")
+            conditions.append("sms.order_uom_rate > 0")
+
+            if supplier_id:
+                conditions.append(f"sms.po_supplier_id = ${param_idx}")
+                params.append(supplier_id)
+                param_idx += 1
+
+            if ud1_code:
+                conditions.append(f"sms.ud1_code = ${param_idx}")
+                params.append(ud1_code)
+                param_idx += 1
+
+            if search:
+                conditions.append(f"(sms.stock_id ILIKE ${param_idx} OR sms.stock_name ILIKE ${param_idx})")
+                params.append(f"%{search}%")
+                param_idx += 1
+
+            where_clause = " AND ".join(conditions)
+
+            query = f"""
+                SELECT
+                    sms.stock_id,
+                    COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
+                    sms.reorder_recommendation,
+                    sms.order_uom,
+                    sms.order_uom_rate,
+                    sms.base_uom,
+                    ROUND(COALESCE(sms.current_balance, 0) / NULLIF(sms.order_uom_rate, 0), 1) as balance_in_order_uom,
+                    sms.order_up_to_level,
+                    CEIL(sms.order_up_to_level - ROUND(COALESCE(sms.current_balance, 0) / NULLIF(sms.order_uom_rate, 0), 1)) as order_qty,
+                    sms.ams_calculated,
+                    sms.days_of_inventory,
+                    sms.ud1_code,
+                    sms.demand_pattern,
+                    sms.abc_class,
+                    -- PO pre-computed fields
+                    sms.po_supplier_id,
+                    sms.po_supplier_source,
+                    sms.po_barcode,
+                    sms.po_barcode_source,
+                    COALESCE(sms.po_unit_price, 0) as po_unit_price,
+                    sms.po_price_source,
+                    sms.po_price_note,
+                    sms.brand_description,
+                    sms.po_data_updated_at,
+                    sms.po_last_generated_at,
+                    -- Calculated fields
+                    ROUND(CEIL(sms.order_up_to_level - ROUND(COALESCE(sms.current_balance, 0) / NULLIF(sms.order_uom_rate, 0), 1)) * COALESCE(sms.po_unit_price, 0), 2) as line_total,
+                    -- Warning flags
+                    CASE WHEN COALESCE(sms.po_price_source, 'NONE') = 'NONE' THEN true ELSE false END as warning_no_price,
+                    CASE WHEN sms.po_price_source = 'INVOICE_ANY' THEN true ELSE false END as warning_uom_mismatch,
+                    CASE WHEN COALESCE(sms.po_barcode, '') = '' THEN true ELSE false END as warning_no_barcode,
+                    CASE WHEN COALESCE(sms.po_supplier_source, 'UNKNOWN') = 'UNKNOWN' THEN true ELSE false END as warning_unknown_supplier
+                FROM wms.stock_movement_summary sms
+                WHERE {where_clause}
+                  AND CEIL(sms.order_up_to_level - ROUND(COALESCE(sms.current_balance, 0) / NULLIF(sms.order_uom_rate, 0), 1)) > 0
+                ORDER BY sms.po_supplier_id, sms.reorder_recommendation, sms.stock_name
+            """
+
+            rows = await conn.fetch(query, *params)
+            items = []
+            for row in rows:
+                item = dict(row)
+                rec = item.get('reorder_recommendation')
+                if rec in _REORDER_DB_TO_DISPLAY:
+                    item['reorder_recommendation'] = _REORDER_DB_TO_DISPLAY[rec]
+                has_warning = (
+                    item.get('warning_no_price', False) or
+                    item.get('warning_uom_mismatch', False) or
+                    item.get('warning_no_barcode', False) or
+                    item.get('warning_unknown_supplier', False)
+                )
+                item['has_warning'] = has_warning
+                items.append(item)
+
+            # Build supplier summaries
+            supplier_map = {}
+            for item in items:
+                sid = item['po_supplier_id'] or 'UNKNOWN'
+                if sid not in supplier_map:
+                    supplier_map[sid] = {
+                        'supplier_id': sid,
+                        'item_count': 0,
+                        'total_value': 0,
+                        'total_qty': 0,
+                        'warning_count': 0,
+                        'last_po_generated_at': None,
+                    }
+                s = supplier_map[sid]
+                s['item_count'] += 1
+                s['total_value'] += float(item.get('line_total', 0) or 0)
+                s['total_qty'] += int(item.get('order_qty', 0) or 0)
+                if item.get('has_warning'):
+                    s['warning_count'] += 1
+                po_gen = item.get('po_last_generated_at')
+                if po_gen and (s['last_po_generated_at'] is None or po_gen > s['last_po_generated_at']):
+                    s['last_po_generated_at'] = po_gen
+
+            suppliers = sorted(supplier_map.values(), key=lambda x: x['total_value'], reverse=True)
+
+            # Round supplier totals
+            for s in suppliers:
+                s['total_value'] = round(s['total_value'], 2)
+
+            total_value = round(sum(s['total_value'] for s in suppliers), 2)
+            warning_count = sum(1 for i in items if i.get('has_warning'))
+
+            # Get freshness timestamp
+            freshness = await conn.fetchval(
+                "SELECT MAX(po_data_updated_at) FROM wms.stock_movement_summary"
+            )
+
+            return {
+                "status": "success",
+                "total_items": len(items),
+                "total_value": total_value,
+                "supplier_count": len(suppliers),
+                "warning_count": warning_count,
+                "po_data_updated_at": freshness.isoformat() if freshness else None,
+                "suppliers": suppliers,
+                "items": items,
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class POLogRequest(BaseModel):
+    supplier_id: str
+    items: List[Dict[str, Any]]  # [{stock_id, order_qty, unit_price}]
+    staff_id: str = "SYSTEM"
+    location_id: str = "WAREHOUSE"
+
+
+@app.post("/api/v1/purchase-orders/log")
+async def log_po_generation(
+    body: POLogRequest,
+    api_key: str = Query(...),
+):
+    """Log a PO generation event. Called when a supplier PO is downloaded.
+
+    Inserts into wms.po_generation_log and updates po_last_generated_at on each item.
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Calculate totals
+            total_qty = sum(i.get('order_qty', 0) for i in body.items)
+            total_value = sum(
+                (i.get('order_qty', 0) or 0) * (i.get('unit_price', 0) or 0)
+                for i in body.items
+            )
+            items_json = [
+                {
+                    'stock_id': i.get('stock_id'),
+                    'order_qty': i.get('order_qty', 0),
+                    'unit_price': i.get('unit_price', 0),
+                    'line_total': round((i.get('order_qty', 0) or 0) * (i.get('unit_price', 0) or 0), 2),
+                }
+                for i in body.items
+            ]
+
+            import json as json_mod
+
+            # Insert PO log
+            po_id = await conn.fetchval("""
+                INSERT INTO wms.po_generation_log
+                    (supplier_id, generated_by, item_count, total_value, total_qty, items, location_id)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+                RETURNING po_id
+            """,
+                body.supplier_id,
+                body.staff_id,
+                len(body.items),
+                round(total_value, 2),
+                total_qty,
+                json_mod.dumps(items_json),
+                body.location_id,
+            )
+
+            # Update po_last_generated_at on each stock_id
+            stock_ids = [i.get('stock_id') for i in body.items if i.get('stock_id')]
+            if stock_ids:
+                await conn.execute("""
+                    UPDATE wms.stock_movement_summary
+                    SET po_last_generated_at = NOW()
+                    WHERE stock_id = ANY($1::text[])
+                """, stock_ids)
+
+            generated_at = await conn.fetchval(
+                "SELECT generated_at FROM wms.po_generation_log WHERE po_id = $1", po_id
+            )
+
+            return {
+                "status": "success",
+                "po_id": po_id,
+                "supplier_id": body.supplier_id,
+                "generated_at": generated_at.isoformat() if generated_at else None,
+                "item_count": len(body.items),
+                "total_value": round(total_value, 2),
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/v1/purchase-orders/history")
+async def get_po_history(
+    api_key: str = Query(...),
+    days: int = Query(default=30, le=365),
+    supplier_id: Optional[str] = Query(default=None),
+):
+    """Get recent PO generation history from wms.po_generation_log."""
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            conditions = ["generated_at >= NOW() - MAKE_INTERVAL(days => $1)"]
+            params = [days]
+            param_idx = 2
+
+            if supplier_id:
+                conditions.append(f"supplier_id = ${param_idx}")
+                params.append(supplier_id)
+                param_idx += 1
+
+            where_clause = " AND ".join(conditions)
+
+            rows = await conn.fetch(f"""
+                SELECT po_id, supplier_id, generated_at, generated_by,
+                       item_count, total_value, total_qty, location_id
+                FROM wms.po_generation_log
+                WHERE {where_clause}
+                ORDER BY generated_at DESC
+                LIMIT 100
+            """, *params)
+
+            return {
+                "status": "success",
+                "history": [dict(row) for row in rows],
+            }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
