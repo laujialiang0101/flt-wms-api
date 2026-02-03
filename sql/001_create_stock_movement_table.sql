@@ -29,10 +29,6 @@ CREATE TABLE IF NOT EXISTS wms.stock_movement_summary (
     --         SPECIAL REQUEST, SLOW MOVER, DISCONTINUED, NEW LIST-IN, NA
     ud1_code VARCHAR(50),
 
-    -- UD2 = ABC-XYZ Classification (auto-updated by this system)
-    -- Values: AX, AY, AZ, BX, BY, BZ, CX, CY, CZ
-    ud2_suggested VARCHAR(10),
-
     -- Therapeutic grouping (from AcStockColorID)
     -- Example: "VITAMIN C", "PARACETAMOL", "OMEGA 3"
     therapeutic_group VARCHAR(100),
@@ -116,6 +112,11 @@ CREATE TABLE IF NOT EXISTS wms.stock_movement_summary (
     -- Cost (for inventory valuation)
     unit_cost NUMERIC,
 
+    -- Last purchase cost (from receipt history - PRIMARY cost source for PO)
+    last_purchase_cost NUMERIC(19,4),
+    last_purchase_date DATE,
+    last_purchase_doc VARCHAR(50),
+
     -- ========================================================================
     -- UOM INFORMATION (for purchasing)
     -- ========================================================================
@@ -146,12 +147,6 @@ CREATE TABLE IF NOT EXISTS wms.stock_movement_summary (
     -- ========================================================================
     -- Does a house brand alternative exist in same therapeutic group?
     has_house_brand_alt BOOLEAN DEFAULT FALSE,
-    house_brand_stock_id VARCHAR(50),
-    house_brand_name VARCHAR(200),
-    house_brand_gp_margin NUMERIC,
-
-    -- Margin opportunity = (house_brand_margin - current_margin) * monthly_qty
-    margin_opportunity_monthly NUMERIC,
 
     -- ========================================================================
     -- TIMESTAMPS
@@ -185,9 +180,9 @@ CREATE INDEX IF NOT EXISTS idx_sms_therapeutic ON wms.stock_movement_summary (th
 -- For health score ranking
 CREATE INDEX IF NOT EXISTS idx_sms_health ON wms.stock_movement_summary (health_score DESC NULLS LAST);
 
--- For margin opportunity
-CREATE INDEX IF NOT EXISTS idx_sms_margin_opp ON wms.stock_movement_summary (margin_opportunity_monthly DESC NULLS LAST)
-    WHERE margin_opportunity_monthly > 0;
+-- For margin opportunity (column dropped - index kept for backwards compat)
+-- CREATE INDEX IF NOT EXISTS idx_sms_margin_opp ON wms.stock_movement_summary (margin_opportunity_monthly DESC NULLS LAST)
+--     WHERE margin_opportunity_monthly > 0;
 
 -- ============================================================================
 -- COMMENTS
@@ -196,7 +191,7 @@ CREATE INDEX IF NOT EXISTS idx_sms_margin_opp ON wms.stock_movement_summary (mar
 COMMENT ON TABLE wms.stock_movement_summary IS 'Real-time stock movement tracking with ABC-XYZ classification. Updated by sync service.';
 
 COMMENT ON COLUMN wms.stock_movement_summary.ud1_code IS 'Stock Type from Dynamod (FLTHB, FLTF1-3, FLTMH, FLTSC, SPECIAL REQUEST, SLOW MOVER, etc.)';
-COMMENT ON COLUMN wms.stock_movement_summary.ud2_suggested IS 'Auto-calculated ABC-XYZ classification to be synced back to Dynamod UD2';
+-- ud2_suggested column dropped (was never populated)
 COMMENT ON COLUMN wms.stock_movement_summary.trend_status IS 'SPIKE_UP (>50%), ACCELERATING (>20%), STABLE, DECELERATING (<-20%), SPIKE_DOWN (<-50%), DEAD';
 COMMENT ON COLUMN wms.stock_movement_summary.health_score IS 'Multi-factor product health score 0-100 (higher = healthier)';
 COMMENT ON COLUMN wms.stock_movement_summary.margin_opportunity_monthly IS 'Potential monthly GP gain if switched to house brand alternative';

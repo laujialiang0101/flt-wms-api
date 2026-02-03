@@ -3192,6 +3192,12 @@ async def setup_stock_movement_table(api_key: str = Query(...)):
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN po_data_updated_at TIMESTAMP;
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN po_last_generated_at TIMESTAMP;
                     END IF;
+                    -- Last purchase cost columns (for accurate PO pricing from receipts)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='last_purchase_cost') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN last_purchase_cost NUMERIC(19,4);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN last_purchase_date DATE;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN last_purchase_doc VARCHAR(50);
+                    END IF;
                 END $$;
             """)
 
@@ -3904,6 +3910,12 @@ async def setup_analytics(api_key: str = Query(...)):
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN brand_description VARCHAR(200);
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN po_data_updated_at TIMESTAMP;
                         ALTER TABLE wms.stock_movement_summary ADD COLUMN po_last_generated_at TIMESTAMP;
+                    END IF;
+                    -- Last purchase cost columns (for accurate PO pricing from receipts)
+                    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='wms' AND table_name='stock_movement_summary' AND column_name='last_purchase_cost') THEN
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN last_purchase_cost NUMERIC(19,4);
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN last_purchase_date DATE;
+                        ALTER TABLE wms.stock_movement_summary ADD COLUMN last_purchase_doc VARCHAR(50);
                     END IF;
                 END $$;
             """)

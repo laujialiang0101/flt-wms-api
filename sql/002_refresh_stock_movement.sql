@@ -346,34 +346,10 @@ WHERE sc."AcStockUOMID" = sc."AcStockUOMIDBaseID"  -- Base UOM only
   AND sc."StockIsActive" = 'Y';
 
 -- ========================================================================
--- Post-processing: Update house brand alternatives
+-- Post-processing: House brand alternatives (DISABLED)
+-- Columns house_brand_stock_id, house_brand_name, house_brand_gp_margin,
+-- margin_opportunity_monthly were dropped as orphaned columns.
 -- ========================================================================
-UPDATE wms.stock_movement_summary sms
-SET
-    has_house_brand_alt = TRUE,
-    house_brand_stock_id = hb.stock_id,
-    house_brand_name = hb.stock_name,
-    house_brand_gp_margin = hb.gp_margin,
-    margin_opportunity_monthly = ROUND((hb.gp_margin - COALESCE(sms.gp_margin_pct, 0)) / 100 * sms.revenue_last_30d, 2)
-FROM (
-    SELECT DISTINCT ON (therapeutic_group)
-           therapeutic_group, stock_id, stock_name, gp_margin
-    FROM (
-        SELECT sc."AcStockColorID" as therapeutic_group,
-               sc."AcStockID" as stock_id,
-               sc."StockDescription1" as stock_name,
-               CASE WHEN s365.revenue > 0 THEN (s365.gp / s365.revenue * 100) ELSE 0 END as gp_margin
-        FROM "AcStockCompany" sc
-        LEFT JOIN sales_365d s365 ON sc."AcStockID" = s365.stock_id
-        WHERE sc."AcStockUOMID" = sc."AcStockUOMIDBaseID"
-          AND sc."StockIsActive" = 'Y'
-          AND sc."AcStockUDGroup1ID" = 'FLTHB'
-    ) hb_inner
-    ORDER BY therapeutic_group, gp_margin DESC
-) hb
-WHERE sms.therapeutic_group = hb.therapeutic_group
-  AND sms.ud1_code NOT IN ('FLTHB', 'FLTF1')  -- Don't suggest switching from high-margin items
-  AND sms.stock_id != hb.stock_id;
 
 -- ========================================================================
 -- Summary Statistics
