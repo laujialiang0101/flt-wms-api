@@ -4517,9 +4517,9 @@ async def get_outlet_sku_intelligence(
                         ROUND(COALESCE(d.qty_m11, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m11,
                         ROUND(COALESCE(d.qty_m12, 0) / NULLIF(d.order_uom_rate, 0), 1) as qty_m12,
                         ROUND(COALESCE(d.total_12m, 0) / NULLIF(d.order_uom_rate, 0), 1) as total_12m,
-                        ROUND(COALESCE(d.ams_12m, 0) / NULLIF(d.order_uom_rate, 0), 2) as ams_12m,
+                        ROUND(COALESCE(d.outlet_ams, 0), 2) as ams_12m,
                         d.pct_of_total,
-                        ROUND(COALESCE(d.ams_calculated, 0) / NULLIF(d.order_uom_rate, 0), 2) as ams_calculated,
+                        ROUND(COALESCE(d.outlet_ams, 0), 2) as ams_calculated,
                         COALESCE(d.velocity_daily, 0) as velocity_daily,
                         COALESCE(d.safety_days, 0) as safety_days,
                         ROUND(COALESCE(d.reorder_point, 0) / NULLIF(d.order_uom_rate, 0), 1) as reorder_point,
@@ -4680,11 +4680,11 @@ async def get_outlet_sku_intelligence(
 
                     -- Aggregated metrics in ORDER UOM
                     ROUND(COALESCE(sml.total_12m, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as total_12m,
-                    ROUND(COALESCE(sml.ams_12m, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 2) as ams_12m,
+                    ROUND(COALESCE(sml.outlet_ams, 0), 2) as ams_12m,
                     sml.pct_of_total,
 
-                    -- Demand-pattern adjusted AMS (same methodology as SKU Intelligence)
-                    ROUND(COALESCE(sml.ams_calculated, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 2) as ams_calculated,
+                    -- Demand-pattern adjusted AMS (already in order UOM from outlet intelligence)
+                    ROUND(COALESCE(sml.outlet_ams, 0), 2) as ams_calculated,
                     COALESCE(sml.velocity_daily, 0) as velocity_daily,
                     COALESCE(sml.safety_days, 0) as safety_days,
                     ROUND(COALESCE(sml.reorder_point, 0) / NULLIF(COALESCE(sms.order_uom_rate, 1), 0), 1) as reorder_point,
@@ -4718,7 +4718,7 @@ async def get_outlet_sku_intelligence(
                 FROM wms.stock_movement_by_location sml
                 LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
                 WHERE {where_clause}
-                ORDER BY sml.ams_calculated DESC NULLS LAST, sml.current_balance DESC NULLS LAST
+                ORDER BY sml.outlet_ams DESC NULLS LAST, sml.current_balance DESC NULLS LAST
                 LIMIT ${param_idx} OFFSET ${param_idx + 1}
             """
 
@@ -4889,15 +4889,15 @@ async def get_cross_outlet_recommendations(
                         stock_id,
                         location_id,
                         location_name,
-                        ams_12m,
+                        outlet_ams,
                         total_12m
                     FROM wms.stock_movement_by_location
                     WHERE location_id = ANY($1::varchar[])
-                    AND ams_12m > 0
+                    AND outlet_ams > 0
                 ),
                 target_outlet_sales AS (
                     -- Products in target outlet
-                    SELECT stock_id, ams_12m, total_12m
+                    SELECT stock_id, outlet_ams, total_12m
                     FROM wms.stock_movement_by_location
                     WHERE location_id = $2
                 ),
@@ -4907,13 +4907,13 @@ async def get_cross_outlet_recommendations(
                         ARRAY_AGG(DISTINCT r.location_id) as selling_outlet_ids,
                         ARRAY_AGG(DISTINCT r.location_name) as selling_outlet_names,
                         COUNT(DISTINCT r.location_id) as outlet_count,
-                        ROUND(AVG(r.ams_12m), 2) as regional_ams,
+                        ROUND(AVG(r.outlet_ams), 2) as regional_ams,
                         ROUND(SUM(r.total_12m), 2) as regional_total,
-                        COALESCE(t.ams_12m, 0) as your_ams
+                        COALESCE(t.outlet_ams, 0) as your_ams
                     FROM regional_sales r
                     LEFT JOIN target_outlet_sales t ON r.stock_id = t.stock_id
-                    WHERE t.ams_12m IS NULL OR t.ams_12m = 0  -- NOT selling in target
-                    GROUP BY r.stock_id, t.ams_12m
+                    WHERE t.outlet_ams IS NULL OR t.outlet_ams = 0  -- NOT selling in target
+                    GROUP BY r.stock_id, t.outlet_ams
                     HAVING COUNT(DISTINCT r.location_id) >= 2  -- At least 2 regional outlets
                 )
                 SELECT
@@ -5038,7 +5038,7 @@ async def get_stock_rotation_recommendations(
                         SELECT
                             sml.stock_id,
                             sml.current_balance,
-                            sml.ams_calculated,
+                            sml.outlet_ams,
                             sml.days_of_inventory,
                             COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1) as order_uom_rate,
                             COALESCE(sms.demand_pattern, 'STABLE') as demand_pattern,
@@ -5046,9 +5046,9 @@ async def get_stock_rotation_recommendations(
 
                             -- Velocity tier (based on AMS in order UOM)
                             CASE
-                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 50 THEN 'FAST'
-                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 10 THEN 'MEDIUM'
-                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 1 THEN 'SLOW'
+                                WHEN sml.outlet_ams / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 50 THEN 'FAST'
+                                WHEN sml.outlet_ams / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 10 THEN 'MEDIUM'
+                                WHEN sml.outlet_ams / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 1 THEN 'SLOW'
                                 ELSE 'VERY_SLOW'
                             END as velocity_tier,
 
@@ -5067,7 +5067,7 @@ async def get_stock_rotation_recommendations(
                         LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
                         WHERE sml.location_id = $1
                           AND sml.current_balance > 0
-                          AND sml.ams_calculated > 0
+                          AND sml.outlet_ams > 0
                     ),
                     this_outlet_excess AS (
                         -- Apply tiered thresholds to identify overstocked items
@@ -5197,14 +5197,14 @@ async def get_stock_rotation_recommendations(
                             sml.location_id,
                             sml.location_name,
                             sml.current_balance as their_balance,
-                            sml.ams_calculated as their_ams,
+                            sml.outlet_ams as their_ams,
                             sml.days_of_inventory as their_doi,
                             -- Need = 2 months coverage - current
-                            GREATEST(0, (COALESCE(sml.ams_calculated, 0) * 2) - sml.current_balance) as need_qty
+                            GREATEST(0, (COALESCE(sml.outlet_ams, 0) * 2) - sml.current_balance) as need_qty
                         FROM wms.stock_movement_by_location sml
                         WHERE sml.location_id != $1
                           AND sml.reorder_recommendation IN ('STOCKOUT', 'ORDER_NOW', 'ORDER_SOON')
-                          AND sml.ams_calculated > 0
+                          AND sml.outlet_ams > 0
                     )
                     SELECT
                         e.stock_id,
@@ -5249,16 +5249,16 @@ async def get_stock_rotation_recommendations(
                         SELECT
                             sml.stock_id,
                             sml.current_balance,
-                            sml.ams_calculated,
+                            sml.outlet_ams,
                             sml.days_of_inventory,
                             COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1) as order_uom_rate,
                             -- Need = 2 months coverage - current
-                            GREATEST(0, (COALESCE(sml.ams_calculated, 0) * 2) - sml.current_balance) as need_qty
+                            GREATEST(0, (COALESCE(sml.outlet_ams, 0) * 2) - sml.current_balance) as need_qty
                         FROM wms.stock_movement_by_location sml
                         LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
                         WHERE sml.location_id = $1
                           AND sml.reorder_recommendation IN ('STOCKOUT', 'ORDER_NOW', 'ORDER_SOON')
-                          AND sml.ams_calculated > 0
+                          AND sml.outlet_ams > 0
                     ),
                     other_outlets_with_tiers AS (
                         -- Calculate tiered thresholds for OTHER outlets' items
@@ -5267,7 +5267,7 @@ async def get_stock_rotation_recommendations(
                             sml.location_id,
                             sml.location_name,
                             sml.current_balance as their_balance,
-                            sml.ams_calculated as their_ams,
+                            sml.outlet_ams as their_ams,
                             sml.days_of_inventory as their_doi,
                             COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1) as order_uom_rate,
                             COALESCE(sms.demand_pattern, 'STABLE') as demand_pattern,
@@ -5275,9 +5275,9 @@ async def get_stock_rotation_recommendations(
 
                             -- Velocity tier
                             CASE
-                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 50 THEN 'FAST'
-                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 10 THEN 'MEDIUM'
-                                WHEN sml.ams_calculated / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 1 THEN 'SLOW'
+                                WHEN sml.outlet_ams / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 50 THEN 'FAST'
+                                WHEN sml.outlet_ams / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 10 THEN 'MEDIUM'
+                                WHEN sml.outlet_ams / NULLIF(COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1), 0) >= 1 THEN 'SLOW'
                                 ELSE 'VERY_SLOW'
                             END as velocity_tier,
 
@@ -5296,7 +5296,7 @@ async def get_stock_rotation_recommendations(
                         LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
                         WHERE sml.location_id != $1
                           AND sml.current_balance > 0
-                          AND sml.ams_calculated > 0
+                          AND sml.outlet_ams > 0
                     ),
                     other_outlets_excess AS (
                         -- Apply tiered thresholds
