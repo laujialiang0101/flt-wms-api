@@ -16,6 +16,7 @@ import os
 import secrets
 import hashlib
 import asyncio
+import time
 from datetime import datetime, date, timedelta
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -26,6 +27,48 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
 
 from expiry_endpoints import create_expiry_router
+
+
+# ============================================================
+# Simple TTL Cache for Analytics Endpoints
+# ============================================================
+class TTLCache:
+    """Simple in-memory cache with TTL (time-to-live) expiration."""
+
+    def __init__(self, default_ttl: int = 300):  # 5 minutes default
+        self._cache: Dict[str, tuple] = {}  # key -> (value, expiry_time)
+        self._default_ttl = default_ttl
+
+    def get(self, key: str) -> Any:
+        """Get value from cache if not expired."""
+        if key in self._cache:
+            value, expiry = self._cache[key]
+            if time.time() < expiry:
+                return value
+            # Expired, remove it
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, value: Any, ttl: int = None) -> None:
+        """Set value in cache with TTL."""
+        ttl = ttl or self._default_ttl
+        self._cache[key] = (value, time.time() + ttl)
+
+    def invalidate(self, pattern: str = None) -> int:
+        """Invalidate cache entries. If pattern provided, only matching keys."""
+        if pattern is None:
+            count = len(self._cache)
+            self._cache.clear()
+            return count
+        # Remove keys matching pattern
+        keys_to_remove = [k for k in self._cache if pattern in k]
+        for k in keys_to_remove:
+            del self._cache[k]
+        return len(keys_to_remove)
+
+
+# Global cache instance (5-minute TTL for analytics data)
+analytics_cache = TTLCache(default_ttl=300)
 
 # Reorder recommendation: DB values <-> Frontend display names
 # UNCERTAIN(REVIEW) + MONITOR(UNKNOWN) merged into single UNCERTAIN card
@@ -176,6 +219,38 @@ async def lifespan(app: FastAPI):
     global pool
     pool = await create_pool_with_retry()
     print("Database pool created")
+
+    # Create performance indexes for analytics queries
+    try:
+        async with pool.acquire() as conn:
+            # Indexes for stock_movement_by_location (heavily used in analytics)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sml_location_ams
+                ON wms.stock_movement_by_location (location_id, outlet_ams)
+                WHERE outlet_ams > 0
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sml_location_balance
+                ON wms.stock_movement_by_location (location_id, current_balance)
+                WHERE current_balance > 0
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sml_stock_location
+                ON wms.stock_movement_by_location (stock_id, location_id)
+            """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sml_doi
+                ON wms.stock_movement_by_location (days_of_inventory)
+            """)
+            # Composite index for common query pattern
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sml_analytics
+                ON wms.stock_movement_by_location (location_id, stock_id, outlet_ams, current_balance, days_of_inventory)
+            """)
+            print("Analytics indexes created/verified")
+    except Exception as e:
+        print(f"Warning: Could not create indexes: {e}")
+
     yield
     if pool:
         await pool.close()
@@ -4945,6 +5020,12 @@ async def get_smart_product_suggestions(
     """
     verify_api_key(api_key)
 
+    # Check cache first (5-minute TTL)
+    cache_key = f"suggestions:{outlet_id}:{category or 'ALL'}:{min_confidence}:{limit}"
+    cached = analytics_cache.get(cache_key)
+    if cached:
+        return cached
+
     try:
         async with pool.acquire() as conn:
             # Verify user access
@@ -5213,7 +5294,7 @@ async def get_smart_product_suggestions(
             avg_confidence = sum(s['confidence_score'] for s in suggestions) / len(suggestions) if suggestions else 0
             high_confidence = len([s for s in suggestions if s['confidence_score'] >= 70])
 
-            return {
+            result = {
                 "status": "success",
                 "outlet_id": outlet_id,
                 "outlet_name": outlet_name,
@@ -5239,6 +5320,9 @@ async def get_smart_product_suggestions(
                     "categories_represented": len(set(s['ud1_code'] for s in suggestions if s['ud1_code']))
                 }
             }
+            # Cache the result for 5 minutes
+            analytics_cache.set(cache_key, result)
+            return result
     except HTTPException:
         raise
     except Exception as e:
@@ -5425,6 +5509,12 @@ async def get_stock_rotation_recommendations(
     Prioritized by: transfer quantity (impact), then DOI difference (urgency)
     """
     verify_api_key(api_key)
+
+    # Check cache first (5-minute TTL)
+    cache_key = f"rotation:{outlet_id}:{direction}:{limit}"
+    cached = analytics_cache.get(cache_key)
+    if cached:
+        return cached
 
     try:
         async with pool.acquire() as conn:
@@ -5851,7 +5941,7 @@ async def get_stock_rotation_recommendations(
             """, outlet_id)
             outlet_name = outlet_name_row['location_name'] if outlet_name_row else outlet_id
 
-            return {
+            result = {
                 "status": "success",
                 "outlet_id": outlet_id,
                 "outlet_name": outlet_name,
@@ -5864,6 +5954,9 @@ async def get_stock_rotation_recommendations(
                     "total_transfer_opportunities": len(transfers_out) + len(transfers_in)
                 }
             }
+            # Cache the result for 5 minutes
+            analytics_cache.set(cache_key, result)
+            return result
     except HTTPException:
         raise
     except Exception as e:
@@ -5922,6 +6015,12 @@ async def get_stock_rebalancing(
     - Respects different lead times for house brand products
     """
     verify_api_key(api_key)
+
+    # Check cache first (5-minute TTL)
+    cache_key = f"rebalancing:{outlet_id}:{limit}"
+    cached = analytics_cache.get(cache_key)
+    if cached:
+        return cached
 
     try:
         async with pool.acquire() as conn:
@@ -6240,7 +6339,7 @@ async def get_stock_rebalancing(
             """, outlet_id)
             outlet_name = outlet_name_row['location_name'] if outlet_name_row else outlet_id
 
-            return {
+            result = {
                 "status": "success",
                 "outlet_id": outlet_id,
                 "outlet_name": outlet_name,
@@ -6265,6 +6364,9 @@ async def get_stock_rebalancing(
                     "total_rebalancing_opportunities": len(donate_to_others) + len(receive_from_others)
                 }
             }
+            # Cache the result for 5 minutes
+            analytics_cache.set(cache_key, result)
+            return result
     except HTTPException:
         raise
     except Exception as e:
