@@ -3,11 +3,13 @@ Farmasi Lautan - Warehouse Management System API
 ================================================
 Separate WMS application sharing the same PostgreSQL database as KPI Tracker.
 
-Features planned:
+Features:
 - Stock allocation to outlets
 - Batch and expiry tracking
 - Movement analysis for purchasing
 - Automated replenishment suggestions
+- Smart Product Suggester (world-class ML-based recommendations)
+- Stock Rebalancing with Fair Share methodology
 """
 
 import os
