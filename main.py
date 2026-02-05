@@ -4391,6 +4391,8 @@ async def get_outlet_sku_intelligence(
     reorder_recommendation: Optional[str] = Query(default=None, description="Filter by action"),
     ud1_code: Optional[str] = Query(default=None, description="Filter by UD1 category"),
     is_active: Optional[str] = Query(default="Y", description="Filter by active status: Y (active), N (inactive), or empty for all"),
+    outlet_demand_pattern: Optional[str] = Query(default=None, description="Filter by outlet demand pattern"),
+    outlet_abc_class: Optional[str] = Query(default=None, description="Filter by outlet ABC class: A, B, C"),
     search: Optional[str] = Query(default=None, description="Search by stock code or name"),
     limit: int = Query(default=500, le=50000),
     offset: int = Query(default=0)
@@ -4437,7 +4439,7 @@ async def get_outlet_sku_intelligence(
 
                 # Determine if we can use instant pagination (no filters + row_num exists)
                 # Note: ANY is_active filter means we need dynamic counts (pre-computed summary has all items)
-                has_filters = bool(reorder_recommendation or _uncertain_filter or ud1_code or search or is_active)
+                has_filters = bool(reorder_recommendation or _uncertain_filter or ud1_code or search or is_active or outlet_demand_pattern or outlet_abc_class)
 
                 # Build WHERE clause
                 conditions = ["d.location_id = $1"]
@@ -4454,6 +4456,33 @@ async def get_outlet_sku_intelligence(
                 if ud1_code:
                     conditions.append(f"d.ud1_code = ${param_idx}")
                     params.append(ud1_code)
+                    param_idx += 1
+
+                if outlet_demand_pattern:
+                    # Map grouped patterns to database values
+                    pattern_mapping = {
+                        'STRONG_GROWTH': ['EXTREME_GROWTH', 'STRONG_GROWTH'],
+                        'GROWTH': ['MODERATE_GROWTH', 'GROWTH', 'STABLE_GROWTH'],
+                        'STABLE': ['STABLE'],
+                        'DECLINE': ['STABLE_DECLINE', 'DECLINE'],
+                        'STRONG_DECLINE': ['STRONG_DECLINE', 'EXTREME_DECLINE'],
+                        'DEAD': ['DEAD', 'NO_HISTORY'],
+                        'NEW': ['NEW'],
+                    }
+                    if outlet_demand_pattern in pattern_mapping:
+                        patterns = pattern_mapping[outlet_demand_pattern]
+                        placeholders = ', '.join([f'${param_idx + i}' for i in range(len(patterns))])
+                        conditions.append(f"d.outlet_demand_pattern IN ({placeholders})")
+                        params.extend(patterns)
+                        param_idx += len(patterns)
+                    else:
+                        conditions.append(f"d.outlet_demand_pattern = ${param_idx}")
+                        params.append(outlet_demand_pattern)
+                        param_idx += 1
+
+                if outlet_abc_class:
+                    conditions.append(f"d.outlet_abc_class = ${param_idx}")
+                    params.append(outlet_abc_class)
                     param_idx += 1
 
                 # Filter by active status (default: active only)
