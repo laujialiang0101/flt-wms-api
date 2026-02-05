@@ -4498,7 +4498,7 @@ async def get_outlet_sku_intelligence(
                     order_clause = "ORDER BY d.row_num"  # Already filtered by row_num > offset
                     limit_clause = f"LIMIT ${param_idx}"
                 else:
-                    order_clause = "ORDER BY d.ams_calculated DESC NULLS LAST, d.current_balance DESC NULLS LAST"
+                    order_clause = "ORDER BY d.outlet_ams DESC NULLS LAST, d.current_balance DESC NULLS LAST"
                     limit_clause = f"LIMIT ${param_idx} OFFSET ${param_idx + 1}"
                     params.append(offset)  # Need offset for non-row_num queries
 
