@@ -4390,6 +4390,7 @@ async def get_outlet_sku_intelligence(
     outlet_id: str = Query(..., description="Outlet/Location ID"),
     reorder_recommendation: Optional[str] = Query(default=None, description="Filter by action"),
     ud1_code: Optional[str] = Query(default=None, description="Filter by UD1 category"),
+    is_active: Optional[str] = Query(default="Y", description="Filter by active status: Y (active), N (inactive), or empty for all"),
     search: Optional[str] = Query(default=None, description="Search by stock code or name"),
     limit: int = Query(default=500, le=50000),
     offset: int = Query(default=0)
@@ -4435,7 +4436,8 @@ async def get_outlet_sku_intelligence(
                 """)
 
                 # Determine if we can use instant pagination (no filters + row_num exists)
-                has_filters = bool(reorder_recommendation or _uncertain_filter or ud1_code or search)
+                # Note: is_active='Y' is default, so only count as filter if it's N or empty (all)
+                has_filters = bool(reorder_recommendation or _uncertain_filter or ud1_code or search or (is_active and is_active != 'Y'))
 
                 # Build WHERE clause
                 conditions = ["d.location_id = $1"]
@@ -4453,6 +4455,13 @@ async def get_outlet_sku_intelligence(
                     conditions.append(f"d.ud1_code = ${param_idx}")
                     params.append(ud1_code)
                     param_idx += 1
+
+                # Filter by active status (default: active only)
+                if is_active == 'Y':
+                    conditions.append("d.is_active = true")
+                elif is_active == 'N':
+                    conditions.append("d.is_active = false")
+                # else: no filter (show all)
 
                 if search:
                     conditions.append(f"(d.stock_id ILIKE ${param_idx} OR d.stock_name ILIKE ${param_idx})")
@@ -4541,7 +4550,11 @@ async def get_outlet_sku_intelligence(
                         d.outlet_variability_class as outlet_var_class,
                         d.trend_index,
                         d.abc_class,
-                        d.last_updated
+                        d.outlet_trend_index,
+                        d.outlet_demand_pattern,
+                        d.outlet_abc_class,
+                        d.last_updated,
+                        COALESCE(d.is_active, true) as is_active
                     FROM wms.outlet_sku_data d
                     WHERE {where_clause}
                     {order_clause}
