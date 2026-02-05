@@ -4893,6 +4893,352 @@ async def get_outlet_sku_intelligence(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/v1/analytics/smart-product-suggestions")
+async def get_smart_product_suggestions(
+    api_key: str = Query(...),
+    outlet_id: str = Query(..., description="Target outlet ID"),
+    staff_id: str = Query(..., description="Staff ID for access control"),
+    category: Optional[str] = Query(default=None, description="Filter by category (ud1_code)"),
+    min_confidence: int = Query(default=50, description="Minimum confidence score (0-100)"),
+    limit: int = Query(default=100, le=500)
+):
+    """World-Class Product Suggester - Learn from REAL historical data to suggest new products.
+
+    PURPOSE: Increase outlet sales by improving inventory assortment through data-driven
+    product suggestions that have HIGH PROBABILITY of success at the target outlet.
+
+    METHODOLOGY (Confidence Score 0-100):
+    =====================================
+    1. REGIONAL SUCCESS SCORE (0-25 points)
+       - Products selling in multiple similar outlets score higher
+       - 5+ outlets = 25, 4 outlets = 20, 3 = 15, 2 = 10
+
+    2. DEMAND STRENGTH SCORE (0-25 points)
+       - Based on AMS across selling outlets
+       - High regional AMS = high score (scaled 0-25)
+
+    3. GROWTH TRAJECTORY SCORE (0-20 points)
+       - STRONG_GROWTH/EXTREME_GROWTH + ACCELERATING/GAINING = 20
+       - GROWTH/MODERATE_GROWTH = 15
+       - STABLE = 10
+       - DECLINE patterns = 0-5
+
+    4. PROFITABILITY SCORE (0-15 points)
+       - GP ABC A = 15, B = 10, C = 5
+       - Prioritizes high-margin products
+
+    5. CATEGORY GAP SCORE (0-15 points)
+       - If outlet under-indexes in category vs region = higher score
+       - Helps balance assortment
+
+    OUTPUT:
+    - confidence_score: 0-100 (higher = more likely to succeed)
+    - predicted_monthly_sales: Based on similar outlet performance
+    - suggested_initial_qty: Conservative 30-day supply
+    - why_suggested: Human-readable explanation
+
+    FILTERS:
+    - category: Filter by product category
+    - min_confidence: Only show suggestions above threshold (default 50)
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Verify user access
+            staff = await conn.fetchrow("""
+                SELECT role, region, allowed_outlets, pos_user_group
+                FROM kpi.staff_list_master
+                WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
+            """, staff_id)
+
+            if not staff:
+                raise HTTPException(status_code=404, detail="Staff not found")
+
+            role = (staff['role'] or '').lower()
+            pos_group = (staff['pos_user_group'] or '').upper().strip()
+
+            # Check access level
+            has_access = (
+                role in ('admin', 'coo', 'cmo', 'director', 'area_manager') or
+                pos_group in ('ADMINISTRATORS', 'COO', 'CMO', 'CEO', 'PURCHASER', 'WAREHOUSE MANAGER', 'AREA MANAGER')
+            )
+
+            if not has_access:
+                return {
+                    "status": "success",
+                    "outlet_id": outlet_id,
+                    "message": "Product suggestions require manager access",
+                    "suggestions": [],
+                    "summary": {}
+                }
+
+            # Get target outlet's profile for similarity matching
+            outlet_profile = await conn.fetchrow("""
+                SELECT
+                    location_id,
+                    location_name,
+                    SUM(total_12m) as total_sales,
+                    COUNT(DISTINCT CASE WHEN outlet_ams > 0 THEN stock_id END) as active_skus,
+                    COUNT(DISTINCT CASE WHEN outlet_abc_class = 'A' THEN stock_id END) as class_a_count
+                FROM wms.stock_movement_by_location
+                WHERE location_id = $1
+                GROUP BY location_id, location_name
+            """, outlet_id)
+
+            if not outlet_profile:
+                raise HTTPException(status_code=404, detail="Outlet not found")
+
+            outlet_name = outlet_profile['location_name']
+            target_total_sales = outlet_profile['total_sales'] or 0
+
+            # Build category filter if provided
+            category_filter = ""
+            params = [outlet_id]
+            param_idx = 2
+
+            if category:
+                category_filter = f"AND sms.ud1_code = ${param_idx}"
+                params.append(category)
+                param_idx += 1
+
+            # World-class product suggestion query
+            query = f"""
+                WITH target_outlet_products AS (
+                    -- Products already at target outlet
+                    SELECT stock_id, outlet_ams, total_12m
+                    FROM wms.stock_movement_by_location
+                    WHERE location_id = $1
+                ),
+                target_category_coverage AS (
+                    -- Category coverage at target outlet
+                    SELECT
+                        sms.ud1_code,
+                        COUNT(DISTINCT sml.stock_id) as target_sku_count,
+                        SUM(sml.total_12m) as target_category_sales
+                    FROM wms.stock_movement_by_location sml
+                    JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                    WHERE sml.location_id = $1 AND sml.outlet_ams > 0
+                    GROUP BY sms.ud1_code
+                ),
+                regional_category_avg AS (
+                    -- Average category coverage across all outlets
+                    SELECT
+                        sms.ud1_code,
+                        AVG(sku_count) as avg_sku_count
+                    FROM (
+                        SELECT
+                            sml.location_id,
+                            sms.ud1_code,
+                            COUNT(DISTINCT sml.stock_id) as sku_count
+                        FROM wms.stock_movement_by_location sml
+                        JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                        WHERE sml.outlet_ams > 0
+                        AND sml.location_id NOT IN ('WAREHOUSE', 'QUARANTINE', 'RETURN', 'S-ISCS')
+                        GROUP BY sml.location_id, sms.ud1_code
+                    ) sub
+                    JOIN wms.stock_movement_summary sms ON sub.ud1_code = sms.ud1_code
+                    GROUP BY sms.ud1_code
+                ),
+                other_outlet_performance AS (
+                    -- Products performing well in OTHER outlets (not target)
+                    -- NOTE: outlet_ams already uses weighted methodology with seasonality factored in
+                    SELECT
+                        sml.stock_id,
+                        COUNT(DISTINCT sml.location_id) as selling_outlet_count,
+                        ARRAY_AGG(DISTINCT sml.location_id) as selling_outlets,
+                        ARRAY_AGG(DISTINCT sml.location_name) as selling_outlet_names,
+                        AVG(sml.outlet_ams) as avg_ams,  -- Already seasonality-adjusted
+                        MAX(sml.outlet_ams) as max_ams,
+                        SUM(sml.total_12m) as total_regional_sales,
+                        -- Demand pattern and momentum already capture growth/seasonality trends
+                        MODE() WITHIN GROUP (ORDER BY sml.outlet_demand_pattern) as dominant_pattern,
+                        MODE() WITHIN GROUP (ORDER BY sml.outlet_momentum_status) as dominant_momentum,
+                        AVG(sml.outlet_trend_index) as avg_trend_index
+                    FROM wms.stock_movement_by_location sml
+                    WHERE sml.location_id != $1
+                    AND sml.location_id NOT IN ('WAREHOUSE', 'QUARANTINE', 'RETURN', 'S-ISCS')
+                    AND sml.outlet_ams > 0  -- Only products with actual sales
+                    GROUP BY sml.stock_id
+                    HAVING COUNT(DISTINCT sml.location_id) >= 2  -- At least 2 outlets selling
+                ),
+                scored_products AS (
+                    SELECT
+                        oop.stock_id,
+                        sms.stock_name,
+                        sms.ud1_code,
+                        sms.order_uom,
+                        COALESCE(sms.order_uom_rate, 1) as order_uom_rate,
+                        sms.abc_class as company_abc,
+                        sms.gp_abc_class,
+                        sms.demand_pattern as company_pattern,
+                        oop.selling_outlet_count,
+                        oop.selling_outlets,
+                        oop.selling_outlet_names,
+                        ROUND(oop.avg_ams::numeric, 2) as avg_regional_ams,
+                        ROUND(oop.max_ams::numeric, 2) as max_regional_ams,
+                        ROUND(oop.total_regional_sales::numeric, 0) as total_regional_sales,
+                        oop.dominant_pattern,
+                        oop.dominant_momentum,
+                        ROUND(oop.avg_trend_index::numeric, 3) as avg_trend_index,
+
+                        -- 1. REGIONAL SUCCESS SCORE (0-25)
+                        CASE
+                            WHEN oop.selling_outlet_count >= 10 THEN 25
+                            WHEN oop.selling_outlet_count >= 7 THEN 22
+                            WHEN oop.selling_outlet_count >= 5 THEN 20
+                            WHEN oop.selling_outlet_count >= 4 THEN 17
+                            WHEN oop.selling_outlet_count >= 3 THEN 14
+                            ELSE 10
+                        END as regional_success_score,
+
+                        -- 2. DEMAND STRENGTH SCORE (0-25)
+                        LEAST(25, ROUND((oop.avg_ams / GREATEST(NULLIF(
+                            (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY outlet_ams)
+                             FROM wms.stock_movement_by_location WHERE outlet_ams > 0), 0), 1)
+                        ) * 25)::int) as demand_strength_score,
+
+                        -- 3. GROWTH TRAJECTORY SCORE (0-20)
+                        CASE
+                            WHEN oop.dominant_pattern IN ('EXTREME_GROWTH', 'STRONG_GROWTH')
+                                 AND oop.dominant_momentum IN ('ACCELERATING', 'GAINING') THEN 20
+                            WHEN oop.dominant_pattern IN ('EXTREME_GROWTH', 'STRONG_GROWTH') THEN 18
+                            WHEN oop.dominant_pattern IN ('GROWTH', 'MODERATE_GROWTH')
+                                 AND oop.dominant_momentum IN ('ACCELERATING', 'GAINING') THEN 16
+                            WHEN oop.dominant_pattern IN ('GROWTH', 'MODERATE_GROWTH') THEN 14
+                            WHEN oop.dominant_pattern = 'STABLE' THEN 10
+                            WHEN oop.dominant_pattern IN ('STABLE_DECLINE', 'DECLINE') THEN 5
+                            WHEN oop.dominant_pattern IN ('STRONG_DECLINE', 'EXTREME_DECLINE') THEN 2
+                            ELSE 8  -- NEW or unknown
+                        END as growth_trajectory_score,
+
+                        -- 4. PROFITABILITY SCORE (0-15)
+                        CASE sms.gp_abc_class
+                            WHEN 'A' THEN 15
+                            WHEN 'B' THEN 10
+                            ELSE 5
+                        END as profitability_score,
+
+                        -- 5. CATEGORY GAP SCORE (0-15)
+                        CASE
+                            WHEN COALESCE(tcc.target_sku_count, 0) <
+                                 COALESCE(rca.avg_sku_count, 0) * 0.5 THEN 15
+                            WHEN COALESCE(tcc.target_sku_count, 0) <
+                                 COALESCE(rca.avg_sku_count, 0) * 0.75 THEN 10
+                            WHEN COALESCE(tcc.target_sku_count, 0) <
+                                 COALESCE(rca.avg_sku_count, 0) THEN 5
+                            ELSE 0
+                        END as category_gap_score
+
+                    FROM other_outlet_performance oop
+                    JOIN wms.stock_movement_summary sms ON oop.stock_id = sms.stock_id
+                    LEFT JOIN target_outlet_products top ON oop.stock_id = top.stock_id
+                    LEFT JOIN target_category_coverage tcc ON sms.ud1_code = tcc.ud1_code
+                    LEFT JOIN regional_category_avg rca ON sms.ud1_code = rca.ud1_code
+                    WHERE (top.outlet_ams IS NULL OR top.outlet_ams = 0)  -- NOT selling at target
+                    AND sms.is_active = true  -- Only active products
+                    {category_filter}
+                )
+                SELECT
+                    *,
+                    -- TOTAL CONFIDENCE SCORE (0-100)
+                    (regional_success_score + demand_strength_score +
+                     growth_trajectory_score + profitability_score + category_gap_score) as confidence_score,
+
+                    -- Predicted monthly sales (conservative: 70% of regional avg)
+                    ROUND(avg_regional_ams * 0.7, 1) as predicted_monthly_sales,
+
+                    -- Suggested initial qty (30-day supply in order UOM)
+                    CEIL((avg_regional_ams * 0.7) / NULLIF(order_uom_rate, 0)) as suggested_initial_qty,
+
+                    -- Why suggested (human-readable)
+                    CONCAT(
+                        'Selling in ', selling_outlet_count, ' outlets',
+                        ' (avg ', ROUND(avg_regional_ams::numeric, 1), '/month)',
+                        CASE WHEN dominant_pattern IN ('EXTREME_GROWTH', 'STRONG_GROWTH', 'GROWTH')
+                             THEN ' • Growing demand'
+                             WHEN dominant_pattern = 'STABLE' THEN ' • Stable demand'
+                             ELSE '' END,
+                        CASE WHEN gp_abc_class = 'A' THEN ' • High margin' ELSE '' END,
+                        CASE WHEN category_gap_score >= 10 THEN ' • Fills category gap' ELSE '' END
+                    ) as why_suggested
+
+                FROM scored_products
+                WHERE (regional_success_score + demand_strength_score +
+                       growth_trajectory_score + profitability_score + category_gap_score) >= ${param_idx}
+                ORDER BY confidence_score DESC, avg_regional_ams DESC
+                LIMIT ${param_idx + 1}
+            """
+
+            params.extend([min_confidence, limit])
+            rows = await conn.fetch(query, *params)
+
+            suggestions = []
+            for row in rows:
+                suggestions.append({
+                    "stock_id": row['stock_id'],
+                    "stock_name": row['stock_name'],
+                    "ud1_code": row['ud1_code'],
+                    "order_uom": row['order_uom'],
+                    "company_abc": row['company_abc'],
+                    "gp_abc_class": row['gp_abc_class'],
+                    "confidence_score": row['confidence_score'],
+                    "score_breakdown": {
+                        "regional_success": row['regional_success_score'],
+                        "demand_strength": row['demand_strength_score'],
+                        "growth_trajectory": row['growth_trajectory_score'],
+                        "profitability": row['profitability_score'],
+                        "category_gap": row['category_gap_score']
+                    },
+                    "selling_outlet_count": row['selling_outlet_count'],
+                    "selling_outlets": row['selling_outlets'][:5] if row['selling_outlets'] else [],
+                    "avg_regional_ams": float(row['avg_regional_ams'] or 0),
+                    "max_regional_ams": float(row['max_regional_ams'] or 0),
+                    "total_regional_sales": float(row['total_regional_sales'] or 0),
+                    "dominant_pattern": row['dominant_pattern'],
+                    "dominant_momentum": row['dominant_momentum'],
+                    "avg_trend_index": float(row['avg_trend_index'] or 0),
+                    "predicted_monthly_sales": float(row['predicted_monthly_sales'] or 0),
+                    "suggested_initial_qty": int(row['suggested_initial_qty'] or 1),
+                    "why_suggested": row['why_suggested']
+                })
+
+            # Summary stats
+            avg_confidence = sum(s['confidence_score'] for s in suggestions) / len(suggestions) if suggestions else 0
+            high_confidence = len([s for s in suggestions if s['confidence_score'] >= 70])
+
+            return {
+                "status": "success",
+                "outlet_id": outlet_id,
+                "outlet_name": outlet_name,
+                "methodology": {
+                    "description": "Multi-factor confidence scoring based on historical performance",
+                    "factors": {
+                        "regional_success": "25 points - Number of outlets successfully selling",
+                        "demand_strength": "25 points - Average monthly sales in region",
+                        "growth_trajectory": "20 points - Demand pattern and momentum",
+                        "profitability": "15 points - GP ABC class (margin)",
+                        "category_gap": "15 points - Fills assortment gap"
+                    }
+                },
+                "filters_applied": {
+                    "category": category,
+                    "min_confidence": min_confidence
+                },
+                "suggestions": suggestions,
+                "summary": {
+                    "total_suggestions": len(suggestions),
+                    "avg_confidence_score": round(avg_confidence, 1),
+                    "high_confidence_count": high_confidence,
+                    "categories_represented": len(set(s['ud1_code'] for s in suggestions if s['ud1_code']))
+                }
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/v1/analytics/outlet-cross-recommendations")
 async def get_cross_outlet_recommendations(
     api_key: str = Query(...),
@@ -5528,27 +5874,46 @@ async def get_stock_rebalancing(
     api_key: str = Query(...),
     outlet_id: str = Query(..., description="Target outlet ID"),
     staff_id: str = Query(..., description="Staff ID for access control"),
-    max_company_doi: int = Query(default=30, description="Max company-wide DOI to consider (supply-constrained items)"),
-    min_doi_variance: int = Query(default=7, description="Minimum DOI difference from average to trigger rebalancing"),
     limit: int = Query(default=100, le=500)
 ):
-    """Get stock rebalancing recommendations for supply-constrained items.
+    """World-Class Stock Rebalancing using Fair Share + Service Level + Priority Scoring.
 
-    Purpose: When company-wide inventory is LOW (supply chain issues) but unevenly
-    distributed across outlets, recommend transfers to balance distribution.
+    PURPOSE: Redistribute inventory to achieve FAIR SHARE allocation across outlets,
+    prioritizing by ABC class and urgency level.
 
-    Logic:
-    1. Find SKUs where company-wide DOI < max_company_doi (supply-constrained)
-    2. Calculate average DOI across all outlets for each SKU
-    3. Identify DONORS: outlets with DOI > average + min_doi_variance
-    4. Identify RECIPIENTS: outlets with DOI < average - min_doi_variance
-    5. Recommend transfers to balance
+    METHODOLOGY:
+    ============
+    1. FAIR SHARE CALCULATION
+       - Each outlet's fair share = (outlet AMS / company AMS) × company inventory
+       - This ensures proportional distribution based on demand
 
-    Example:
-    - SKU "ABC123": Company DOI = 14 days, Average outlet DOI = 13 days
-    - Outlet A: 30 days → DONOR (excess of 17 days above avg)
-    - Outlet B: 2 days → RECIPIENT (11 days below avg)
-    - Transfer from A → B to balance
+    2. SERVICE LEVEL TARGETS (by product type)
+       - Standard products: Company DOI < 30 days triggers rebalancing
+       - House Brand (FLTHB): Company DOI < 60 days (longer lead times)
+
+    3. URGENCY TIERS
+       - CRITICAL: Company DOI < 14 days (or < 30 for house brand)
+       - URGENT: Company DOI < 30 days (or < 60 for house brand)
+       - MODERATE: Company DOI < 45 days (or < 90 for house brand)
+
+    4. PRIORITY SCORING (higher = more important)
+       Priority = ABC_weight × Urgency_weight × Demand_impact
+       - ABC A items: 3x weight (highest priority)
+       - ABC B items: 2x weight
+       - ABC C items: 1x weight
+       - CRITICAL urgency: 3x multiplier
+       - URGENT: 2x multiplier
+       - MODERATE: 1x multiplier
+
+    5. TRANSFER CALCULATION
+       - Donor gives: MIN(excess above fair share, available to donate)
+       - Recipient gets: MIN(shortage below fair share, what they need)
+       - Transfer qty = MIN(donor can give, recipient needs)
+
+    BENEFITS:
+    - Ensures equitable distribution based on actual demand
+    - Prioritizes high-value items (ABC A) and urgent situations
+    - Respects different lead times for house brand products
     """
     verify_api_key(api_key)
 
@@ -5586,14 +5951,19 @@ async def get_stock_rebalancing(
             receive_from_others = []
 
             # ============================================================
-            # REBALANCING QUERY
-            # Find supply-constrained SKUs with uneven distribution
+            # WORLD-CLASS REBALANCING QUERY
+            # Fair Share + Service Level + Priority Scoring
             # ============================================================
+            # Configuration parameters
+            min_doi_variance = 7  # Minimum DOI difference to trigger rebalancing
+
             query = """
                 WITH company_totals AS (
                     -- Calculate company-wide metrics for each SKU
                     SELECT
                         sml.stock_id,
+                        COALESCE(sms.ud1_code, 'OTHER') as ud1_code,
+                        COALESCE(sms.abc_class, 'C') as abc_class,
                         SUM(sml.current_balance) as total_balance,
                         SUM(sml.outlet_ams) as total_ams,
                         CASE
@@ -5603,18 +5973,66 @@ async def get_stock_rebalancing(
                         END as company_doi,
                         COUNT(DISTINCT sml.location_id) as outlet_count
                     FROM wms.stock_movement_by_location sml
+                    LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
                     WHERE sml.current_balance > 0 OR sml.outlet_ams > 0
-                    GROUP BY sml.stock_id
+                    GROUP BY sml.stock_id, sms.ud1_code, sms.abc_class
                     HAVING SUM(sml.outlet_ams) > 0  -- Must have some sales
                 ),
                 supply_constrained AS (
-                    -- Filter to supply-constrained items (company DOI < threshold)
-                    SELECT * FROM company_totals
-                    WHERE company_doi < $1  -- max_company_doi parameter
+                    -- Filter to supply-constrained items based on category thresholds
+                    -- House Brand (FLTHB): DOI < 60 days (longer lead times)
+                    -- Standard products: DOI < 30 days
+                    SELECT
+                        *,
+                        CASE ud1_code
+                            WHEN 'FLTHB' THEN 60
+                            ELSE 30
+                        END as doi_threshold,
+                        -- Urgency tier based on DOI vs threshold
+                        CASE
+                            WHEN ud1_code = 'FLTHB' THEN
+                                CASE
+                                    WHEN company_doi < 30 THEN 'CRITICAL'
+                                    WHEN company_doi < 60 THEN 'URGENT'
+                                    WHEN company_doi < 90 THEN 'MODERATE'
+                                    ELSE 'LOW'
+                                END
+                            ELSE
+                                CASE
+                                    WHEN company_doi < 14 THEN 'CRITICAL'
+                                    WHEN company_doi < 30 THEN 'URGENT'
+                                    WHEN company_doi < 45 THEN 'MODERATE'
+                                    ELSE 'LOW'
+                                END
+                        END as urgency_tier,
+                        -- Priority score = ABC weight × Urgency weight
+                        (CASE abc_class WHEN 'A' THEN 3.0 WHEN 'B' THEN 2.0 ELSE 1.0 END) *
+                        (CASE ud1_code
+                            WHEN 'FLTHB' THEN
+                                CASE
+                                    WHEN company_doi < 30 THEN 3.0
+                                    WHEN company_doi < 60 THEN 2.0
+                                    WHEN company_doi < 90 THEN 1.5
+                                    ELSE 1.0
+                                END
+                            ELSE
+                                CASE
+                                    WHEN company_doi < 14 THEN 3.0
+                                    WHEN company_doi < 30 THEN 2.0
+                                    WHEN company_doi < 45 THEN 1.5
+                                    ELSE 1.0
+                                END
+                        END) as priority_score
+                    FROM company_totals
+                    WHERE (
+                        -- Supply constrained based on category
+                        (ud1_code = 'FLTHB' AND company_doi < 90) OR  -- House brand: wider threshold
+                        (ud1_code != 'FLTHB' AND company_doi < 45)    -- Standard: tighter threshold
+                    )
                     AND outlet_count >= 2   -- Must be in multiple outlets
                 ),
                 outlet_distribution AS (
-                    -- Get DOI for each outlet-SKU combination
+                    -- Get fair share and actual balance for each outlet-SKU
                     SELECT
                         sml.stock_id,
                         sml.location_id,
@@ -5626,49 +6044,55 @@ async def get_stock_rebalancing(
                         sc.company_doi,
                         sc.total_balance,
                         sc.total_ams,
-                        sc.outlet_count
+                        sc.outlet_count,
+                        sc.ud1_code,
+                        sc.abc_class,
+                        sc.urgency_tier,
+                        sc.priority_score,
+                        sc.doi_threshold,
+                        -- Fair share calculation: outlet's demand proportion × total inventory
+                        CASE WHEN sc.total_ams > 0
+                            THEN (sml.outlet_ams / sc.total_ams) * sc.total_balance
+                            ELSE 0
+                        END as fair_share_qty,
+                        -- Deviation from fair share
+                        sml.current_balance - CASE WHEN sc.total_ams > 0
+                            THEN (sml.outlet_ams / sc.total_ams) * sc.total_balance
+                            ELSE 0
+                        END as fair_share_deviation
                     FROM wms.stock_movement_by_location sml
                     JOIN supply_constrained sc ON sml.stock_id = sc.stock_id
                     LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
-                    WHERE sml.current_balance > 0 OR sml.outlet_ams > 0
-                ),
-                sku_averages AS (
-                    -- Calculate average DOI per SKU (across outlets with stock/sales)
-                    SELECT
-                        stock_id,
-                        AVG(days_of_inventory) as avg_doi,
-                        STDDEV(days_of_inventory) as stddev_doi
-                    FROM outlet_distribution
-                    WHERE days_of_inventory IS NOT NULL AND days_of_inventory < 9999
-                    GROUP BY stock_id
+                    WHERE sml.outlet_ams > 0  -- Only outlets with demand
                 ),
                 classified AS (
-                    -- Classify each outlet-SKU as DONOR, RECIPIENT, or BALANCED
+                    -- Classify based on fair share deviation and DOI variance
                     SELECT
                         od.*,
-                        sa.avg_doi,
-                        sa.stddev_doi,
-                        od.days_of_inventory - sa.avg_doi as doi_variance,
                         CASE
-                            WHEN od.days_of_inventory > sa.avg_doi + $2 THEN 'DONOR'
-                            WHEN od.days_of_inventory < sa.avg_doi - $2 THEN 'RECIPIENT'
+                            -- Donor: has MORE than fair share AND high DOI (overstocked relative to others)
+                            WHEN od.fair_share_deviation > 0
+                                AND od.days_of_inventory > od.company_doi + $1 THEN 'DONOR'
+                            -- Recipient: has LESS than fair share AND low DOI (understocked relative to others)
+                            WHEN od.fair_share_deviation < 0
+                                AND od.days_of_inventory < od.company_doi - $1 THEN 'RECIPIENT'
                             ELSE 'BALANCED'
                         END as classification,
-                        -- Calculate transferable qty (in base UOM)
+                        -- Donor can give: excess above fair share (capped to not go below fair share)
                         CASE
-                            WHEN od.days_of_inventory > sa.avg_doi + $2 THEN
-                                -- Donor can give: excess above (avg + buffer) in days worth of stock
-                                GREATEST(0, od.current_balance - (od.outlet_ams / 30.0 * (sa.avg_doi + $2)))
+                            WHEN od.fair_share_deviation > 0
+                                AND od.days_of_inventory > od.company_doi + $1 THEN
+                                GREATEST(0, od.fair_share_deviation * 0.8)  -- Keep 20% buffer
                             ELSE 0
                         END as can_donate_qty,
+                        -- Recipient needs: shortage below fair share
                         CASE
-                            WHEN od.days_of_inventory < sa.avg_doi - $2 THEN
-                                -- Recipient needs: shortage below (avg - buffer) in days worth of stock
-                                GREATEST(0, (od.outlet_ams / 30.0 * (sa.avg_doi - $2)) - od.current_balance)
+                            WHEN od.fair_share_deviation < 0
+                                AND od.days_of_inventory < od.company_doi - $1 THEN
+                                GREATEST(0, ABS(od.fair_share_deviation))
                             ELSE 0
                         END as need_qty
                     FROM outlet_distribution od
-                    JOIN sku_averages sa ON od.stock_id = sa.stock_id
                 ),
                 donors AS (
                     SELECT * FROM classified WHERE classification = 'DONOR' AND can_donate_qty > 0
@@ -5685,18 +6109,24 @@ async def get_stock_rebalancing(
                         d.days_of_inventory as from_doi,
                         d.current_balance as from_balance,
                         d.can_donate_qty,
-                        d.avg_doi,
+                        d.company_doi as avg_doi,
                         d.company_doi,
                         d.order_uom_rate,
+                        d.ud1_code,
+                        d.abc_class,
+                        d.urgency_tier,
+                        d.priority_score,
+                        d.fair_share_qty as from_fair_share,
                         r.location_id as to_outlet,
                         r.location_name as to_outlet_name,
                         r.days_of_inventory as to_doi,
                         r.current_balance as to_balance,
                         r.need_qty,
+                        r.fair_share_qty as to_fair_share,
                         LEAST(d.can_donate_qty, r.need_qty) as transfer_qty
                     FROM donors d
                     JOIN recipients r ON d.stock_id = r.stock_id AND d.location_id != r.location_id
-                    WHERE d.location_id = $3  -- This outlet is donor
+                    WHERE d.location_id = $2  -- This outlet is donor
                 ),
                 -- RECEIVE FROM OTHERS: This outlet is a RECIPIENT, find donors
                 receive_matches AS (
@@ -5707,26 +6137,35 @@ async def get_stock_rebalancing(
                         d.days_of_inventory as from_doi,
                         d.current_balance as from_balance,
                         d.can_donate_qty,
-                        r.avg_doi,
+                        r.company_doi as avg_doi,
                         r.company_doi,
                         r.order_uom_rate,
+                        r.ud1_code,
+                        r.abc_class,
+                        r.urgency_tier,
+                        r.priority_score,
+                        d.fair_share_qty as from_fair_share,
                         r.location_id as to_outlet,
                         r.location_name as to_outlet_name,
                         r.days_of_inventory as to_doi,
                         r.current_balance as to_balance,
                         r.need_qty,
+                        r.fair_share_qty as to_fair_share,
                         LEAST(d.can_donate_qty, r.need_qty) as transfer_qty
                     FROM recipients r
                     JOIN donors d ON r.stock_id = d.stock_id AND r.location_id != d.location_id
-                    WHERE r.location_id = $3  -- This outlet is recipient
+                    WHERE r.location_id = $2  -- This outlet is recipient
                 )
                 SELECT
                     'DONATE' as direction,
                     m.stock_id,
                     COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
                     sms.order_uom,
-                    sms.ud1_code,
+                    m.ud1_code,
                     sms.demand_pattern,
+                    m.abc_class,
+                    m.urgency_tier,
+                    m.priority_score,
                     m.from_outlet,
                     m.from_outlet_name,
                     m.to_outlet,
@@ -5737,6 +6176,8 @@ async def get_stock_rebalancing(
                     ROUND(m.company_doi, 0) as company_doi,
                     ROUND(m.from_balance / NULLIF(m.order_uom_rate, 0), 0) as from_balance_order_uom,
                     ROUND(m.to_balance / NULLIF(m.order_uom_rate, 0), 0) as to_balance_order_uom,
+                    ROUND(m.from_fair_share / NULLIF(m.order_uom_rate, 0), 0) as from_fair_share,
+                    ROUND(m.to_fair_share / NULLIF(m.order_uom_rate, 0), 0) as to_fair_share,
                     ROUND(m.transfer_qty / NULLIF(m.order_uom_rate, 0), 0) as transfer_qty,
                     'REBALANCE' as transfer_reason
                 FROM donate_matches m
@@ -5750,8 +6191,11 @@ async def get_stock_rebalancing(
                     m.stock_id,
                     COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
                     sms.order_uom,
-                    sms.ud1_code,
+                    m.ud1_code,
                     sms.demand_pattern,
+                    m.abc_class,
+                    m.urgency_tier,
+                    m.priority_score,
                     m.from_outlet,
                     m.from_outlet_name,
                     m.to_outlet,
@@ -5762,17 +6206,19 @@ async def get_stock_rebalancing(
                     ROUND(m.company_doi, 0) as company_doi,
                     ROUND(m.from_balance / NULLIF(m.order_uom_rate, 0), 0) as from_balance_order_uom,
                     ROUND(m.to_balance / NULLIF(m.order_uom_rate, 0), 0) as to_balance_order_uom,
+                    ROUND(m.from_fair_share / NULLIF(m.order_uom_rate, 0), 0) as from_fair_share,
+                    ROUND(m.to_fair_share / NULLIF(m.order_uom_rate, 0), 0) as to_fair_share,
                     ROUND(m.transfer_qty / NULLIF(m.order_uom_rate, 0), 0) as transfer_qty,
                     'REBALANCE' as transfer_reason
                 FROM receive_matches m
                 LEFT JOIN wms.stock_movement_summary sms ON m.stock_id = sms.stock_id
                 WHERE m.transfer_qty > 0
 
-                ORDER BY transfer_qty DESC
-                LIMIT $4
+                ORDER BY priority_score DESC, transfer_qty DESC
+                LIMIT $3
             """
 
-            rows = await conn.fetch(query, max_company_doi, min_doi_variance, outlet_id, limit)
+            rows = await conn.fetch(query, min_doi_variance, outlet_id, limit)
 
             for row in rows:
                 row_dict = dict(row)
@@ -5792,9 +6238,18 @@ async def get_stock_rebalancing(
                 "status": "success",
                 "outlet_id": outlet_id,
                 "outlet_name": outlet_name,
-                "parameters": {
-                    "max_company_doi": max_company_doi,
-                    "min_doi_variance": min_doi_variance
+                "methodology": {
+                    "description": "Fair Share + Service Level + Priority Scoring",
+                    "thresholds": {
+                        "house_brand_doi": 90,  # FLTHB triggers at < 90 days
+                        "standard_doi": 45,     # Others trigger at < 45 days
+                        "min_doi_variance": min_doi_variance
+                    },
+                    "urgency_tiers": {
+                        "CRITICAL": "House Brand < 30d, Standard < 14d",
+                        "URGENT": "House Brand < 60d, Standard < 30d",
+                        "MODERATE": "House Brand < 90d, Standard < 45d"
+                    }
                 },
                 "donate_to_others": donate_to_others,
                 "receive_from_others": receive_from_others,
