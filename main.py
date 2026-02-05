@@ -5020,12 +5020,6 @@ async def get_smart_product_suggestions(
     """
     verify_api_key(api_key)
 
-    # Check cache first (5-minute TTL)
-    cache_key = f"suggestions:{outlet_id}:{category or 'ALL'}:{min_confidence}:{limit}"
-    cached = analytics_cache.get(cache_key)
-    if cached:
-        return cached
-
     try:
         async with pool.acquire() as conn:
             # Verify user access
@@ -5320,9 +5314,6 @@ async def get_smart_product_suggestions(
                     "categories_represented": len(set(s['ud1_code'] for s in suggestions if s['ud1_code']))
                 }
             }
-            # Cache the result for 5 minutes
-            analytics_cache.set(cache_key, result)
-            return result
     except HTTPException:
         raise
     except Exception as e:
@@ -5509,12 +5500,6 @@ async def get_stock_rotation_recommendations(
     Prioritized by: transfer quantity (impact), then DOI difference (urgency)
     """
     verify_api_key(api_key)
-
-    # Check cache first (5-minute TTL)
-    cache_key = f"rotation:{outlet_id}:{direction}:{limit}"
-    cached = analytics_cache.get(cache_key)
-    if cached:
-        return cached
 
     try:
         async with pool.acquire() as conn:
@@ -5941,7 +5926,7 @@ async def get_stock_rotation_recommendations(
             """, outlet_id)
             outlet_name = outlet_name_row['location_name'] if outlet_name_row else outlet_id
 
-            result = {
+            return {
                 "status": "success",
                 "outlet_id": outlet_id,
                 "outlet_name": outlet_name,
@@ -5954,9 +5939,6 @@ async def get_stock_rotation_recommendations(
                     "total_transfer_opportunities": len(transfers_out) + len(transfers_in)
                 }
             }
-            # Cache the result for 5 minutes
-            analytics_cache.set(cache_key, result)
-            return result
     except HTTPException:
         raise
     except Exception as e:
@@ -6015,12 +5997,6 @@ async def get_stock_rebalancing(
     - Respects different lead times for house brand products
     """
     verify_api_key(api_key)
-
-    # Check cache first (5-minute TTL)
-    cache_key = f"rebalancing:{outlet_id}:{limit}"
-    cached = analytics_cache.get(cache_key)
-    if cached:
-        return cached
 
     try:
         async with pool.acquire() as conn:
@@ -6364,9 +6340,6 @@ async def get_stock_rebalancing(
                     "total_rebalancing_opportunities": len(donate_to_others) + len(receive_from_others)
                 }
             }
-            # Cache the result for 5 minutes
-            analytics_cache.set(cache_key, result)
-            return result
     except HTTPException:
         raise
     except Exception as e:
