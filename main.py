@@ -4577,7 +4577,7 @@ async def get_outlet_sku_intelligence(
                         GROUP BY COALESCE(d.reorder_recommendation, 'REVIEW')
                     """, outlet_id)
 
-                    summary = {'STOCKOUT': 0, 'ORDER_NOW': 0, 'ORDER_SOON': 0, 'OPTIMAL': 0, 'OVERSTOCKED': 0, 'DELIST': 0, 'UNCERTAIN': 0}
+                    summary = {'STOCKOUT': 0, 'ORDER_NOW': 0, 'ORDER_SOON': 0, 'OPTIMAL': 0, 'REDUCE': 0, 'OVERSTOCKED': 0, 'DELIST': 0, 'UNCERTAIN': 0}
                     for row in summary_rows:
                         rec = row['rec']
                         cnt = row['cnt']
@@ -4589,10 +4589,12 @@ async def get_outlet_sku_intelligence(
                             summary['ORDER_SOON'] = cnt
                         elif rec == 'OPTIMAL':
                             summary['OPTIMAL'] = cnt
-                        elif rec in ('REDUCE_ORDER', 'STOP_ORDERING'):
-                            summary['OVERSTOCKED'] = summary.get('OVERSTOCKED', 0) + cnt
+                        elif rec == 'REDUCE_ORDER':
+                            summary['REDUCE'] = cnt
+                        elif rec == 'STOP_ORDERING':
+                            summary['OVERSTOCKED'] = cnt
                         elif rec == 'DELIST_CANDIDATE':
-                            summary['DELIST'] = summary.get('DELIST', 0) + cnt
+                            summary['DELIST'] = cnt
                         elif rec in ('REVIEW', 'UNKNOWN'):
                             summary['UNCERTAIN'] = summary.get('UNCERTAIN', 0) + cnt
 
