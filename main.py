@@ -5026,7 +5026,7 @@ async def get_smart_product_suggestions(
                 regional_category_avg AS (
                     -- Average category coverage across all outlets
                     SELECT
-                        sms.ud1_code,
+                        ud1_code,
                         AVG(sku_count) as avg_sku_count
                     FROM (
                         SELECT
@@ -5039,8 +5039,7 @@ async def get_smart_product_suggestions(
                         AND sml.location_id NOT IN ('WAREHOUSE', 'QUARANTINE', 'RETURN', 'S-ISCS')
                         GROUP BY sml.location_id, sms.ud1_code
                     ) sub
-                    JOIN wms.stock_movement_summary sms ON sub.ud1_code = sms.ud1_code
-                    GROUP BY sms.ud1_code
+                    GROUP BY ud1_code
                 ),
                 other_outlet_performance AS (
                     -- Products performing well in OTHER outlets (not target)
@@ -5095,10 +5094,15 @@ async def get_smart_product_suggestions(
                         END as regional_success_score,
 
                         -- 2. DEMAND STRENGTH SCORE (0-25)
-                        LEAST(25, ROUND((oop.avg_ams / GREATEST(NULLIF(
-                            (SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY outlet_ams)
-                             FROM wms.stock_movement_by_location WHERE outlet_ams > 0), 0), 1)
-                        ) * 25)::int) as demand_strength_score,
+                        -- Based on AMS tiers: 50+ = 25, 20+ = 20, 10+ = 15, 5+ = 10, 1+ = 5
+                        CASE
+                            WHEN oop.avg_ams >= 50 THEN 25
+                            WHEN oop.avg_ams >= 20 THEN 20
+                            WHEN oop.avg_ams >= 10 THEN 15
+                            WHEN oop.avg_ams >= 5 THEN 10
+                            WHEN oop.avg_ams >= 1 THEN 5
+                            ELSE 2
+                        END as demand_strength_score,
 
                         -- 3. GROWTH TRAJECTORY SCORE (0-20)
                         CASE
