@@ -5539,10 +5539,19 @@ async def get_stock_rotation_recommendations(
             # ============================================================
             # TRANSFERS OUT: This outlet is OVERSTOCKED, others need stock
             # Uses TIERED logic based on velocity + demand pattern
+            # FIXED: Now uses ROW_NUMBER to return SINGLE best destination per SKU
+            #        Prioritizes: 1) Same region, 2) Highest urgency (lowest DOI)
             # ============================================================
             if direction in ('out', 'both'):
                 out_query = """
-                    WITH this_outlet_with_tiers AS (
+                    WITH source_outlet_region AS (
+                        -- Get source outlet's region (e.g., 'R5' from 'R5 - PASIR PUTEH')
+                        SELECT SUBSTRING(location_name FROM '^R[0-9]+') as region
+                        FROM wms.stock_movement_by_location
+                        WHERE location_id = $1
+                        LIMIT 1
+                    ),
+                    this_outlet_with_tiers AS (
                         -- Calculate tiered thresholds for THIS outlet's items
                         SELECT
                             sml.stock_id,
@@ -5701,11 +5710,12 @@ async def get_stock_rotation_recommendations(
                           )
                     ),
                     other_outlets_need AS (
-                        -- Items understocked at OTHER outlets
+                        -- Items understocked at OTHER outlets (with region info)
                         SELECT
                             sml.stock_id,
                             sml.location_id,
                             sml.location_name,
+                            SUBSTRING(sml.location_name FROM '^R[0-9]+') as dest_region,
                             sml.current_balance as their_balance,
                             sml.outlet_ams as their_ams,
                             sml.days_of_inventory as their_doi,
@@ -5713,36 +5723,69 @@ async def get_stock_rotation_recommendations(
                             GREATEST(0, (COALESCE(sml.outlet_ams, 0) * 2) - sml.current_balance) as need_qty
                         FROM wms.stock_movement_by_location sml
                         WHERE sml.location_id != $1
+                          AND sml.location_id NOT IN ('WAREHOUSE', 'QUARANTINE', 'RETURN', 'S-ISCS')
                           AND sml.reorder_recommendation IN ('STOCKOUT', 'ORDER_NOW', 'ORDER_SOON')
                           AND sml.outlet_ams > 0
+                    ),
+                    ranked_destinations AS (
+                        -- Rank destinations: same region first, then by urgency (lowest DOI)
+                        -- ONLY keep TOP 1 destination per SKU to avoid over-allocation
+                        SELECT
+                            e.stock_id,
+                            e.current_balance,
+                            e.outlet_ams as ams_calculated,
+                            e.days_of_inventory,
+                            e.order_uom_rate,
+                            e.demand_pattern,
+                            e.velocity_tier,
+                            e.pattern_category,
+                            e.doi_threshold,
+                            e.excess_qty,
+                            n.location_id as to_outlet,
+                            n.location_name as to_outlet_name,
+                            n.their_balance,
+                            n.their_doi,
+                            n.need_qty,
+                            -- Priority: 1=same region, 2=different region
+                            CASE WHEN n.dest_region = (SELECT region FROM source_outlet_region) THEN 1 ELSE 2 END as region_priority,
+                            -- Rank by region first, then by urgency (lowest DOI = most urgent)
+                            ROW_NUMBER() OVER (
+                                PARTITION BY e.stock_id
+                                ORDER BY
+                                    CASE WHEN n.dest_region = (SELECT region FROM source_outlet_region) THEN 0 ELSE 1 END,
+                                    n.their_doi ASC,
+                                    n.need_qty DESC
+                            ) as dest_rank
+                        FROM filtered_excess e
+                        JOIN other_outlets_need n ON e.stock_id = n.stock_id
+                        WHERE e.excess_qty > 0 AND n.need_qty > 0
                     )
                     SELECT
-                        e.stock_id,
+                        r.stock_id,
                         COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
                         sms.order_uom,
                         sms.ud1_code,
-                        e.demand_pattern,
-                        e.velocity_tier,
-                        e.pattern_category,
-                        e.doi_threshold,
+                        r.demand_pattern,
+                        r.velocity_tier,
+                        r.pattern_category,
+                        r.doi_threshold,
                         $1 as from_outlet,
                         (SELECT location_name FROM wms.stock_movement_by_location WHERE location_id = $1 LIMIT 1) as from_outlet_name,
-                        n.location_id as to_outlet,
-                        n.location_name as to_outlet_name,
-                        ROUND(e.days_of_inventory, 0) as from_doi,
-                        ROUND(n.their_doi, 0) as to_doi,
-                        ROUND(e.current_balance / NULLIF(e.order_uom_rate, 0), 0) as from_balance_order_uom,
-                        ROUND(n.their_balance / NULLIF(e.order_uom_rate, 0), 0) as to_balance_order_uom,
+                        r.to_outlet,
+                        r.to_outlet_name,
+                        ROUND(r.days_of_inventory, 0) as from_doi,
+                        ROUND(r.their_doi, 0) as to_doi,
+                        ROUND(r.current_balance / NULLIF(r.order_uom_rate, 0), 0) as from_balance_order_uom,
+                        ROUND(r.their_balance / NULLIF(r.order_uom_rate, 0), 0) as to_balance_order_uom,
                         -- Transfer qty = MIN(excess, need), in ORDER UOM
-                        ROUND(LEAST(e.excess_qty, n.need_qty) / NULLIF(e.order_uom_rate, 0), 0) as transfer_qty,
-                        ROUND(e.excess_qty / NULLIF(e.order_uom_rate, 0), 0) as excess_qty_order_uom,
-                        ROUND(n.need_qty / NULLIF(e.order_uom_rate, 0), 0) as need_qty_order_uom,
-                        'EXCESS_TO_NEED' as transfer_reason
-                    FROM filtered_excess e
-                    JOIN other_outlets_need n ON e.stock_id = n.stock_id
-                    LEFT JOIN wms.stock_movement_summary sms ON e.stock_id = sms.stock_id
-                    WHERE e.excess_qty > 0 AND n.need_qty > 0
-                    ORDER BY LEAST(e.excess_qty, n.need_qty) DESC, (e.days_of_inventory - n.their_doi) DESC
+                        ROUND(LEAST(r.excess_qty, r.need_qty) / NULLIF(r.order_uom_rate, 0), 0) as transfer_qty,
+                        ROUND(r.excess_qty / NULLIF(r.order_uom_rate, 0), 0) as excess_qty_order_uom,
+                        ROUND(r.need_qty / NULLIF(r.order_uom_rate, 0), 0) as need_qty_order_uom,
+                        CASE WHEN r.region_priority = 1 THEN 'SAME_REGION' ELSE 'OTHER_REGION' END as transfer_reason
+                    FROM ranked_destinations r
+                    LEFT JOIN wms.stock_movement_summary sms ON r.stock_id = sms.stock_id
+                    WHERE r.dest_rank = 1  -- Only the BEST destination per SKU
+                    ORDER BY r.excess_qty DESC, (r.days_of_inventory - r.their_doi) DESC
                     LIMIT $2
                 """
                 out_rows = await conn.fetch(out_query, outlet_id, limit)
@@ -5877,44 +5920,86 @@ async def get_stock_rotation_recommendations(
                         FROM other_outlets_with_tiers t
                     ),
                     filtered_other_excess AS (
-                        -- Filter to items exceeding tiered thresholds
+                        -- Filter to items exceeding tiered thresholds (with region info)
                         SELECT
                             e.*,
+                            SUBSTRING(e.location_name FROM '^R[0-9]+') as source_region,
                             GREATEST(e.raw_excess_qty, 0) as excess_qty
                         FROM other_outlets_excess e
                         WHERE e.their_doi > e.doi_threshold
+                          AND e.location_id NOT IN ('WAREHOUSE', 'QUARANTINE', 'RETURN', 'S-ISCS')
                           AND (
                               (e.velocity_tier = 'VERY_SLOW' AND (e.raw_excess_qty > e.their_ams * e.excess_months_threshold OR e.raw_excess_qty > 5))
                               OR (e.velocity_tier != 'VERY_SLOW' AND e.raw_excess_qty > e.their_ams * e.excess_months_threshold)
                           )
+                    ),
+                    dest_outlet_region AS (
+                        -- Get destination outlet's region
+                        SELECT SUBSTRING(location_name FROM '^R[0-9]+') as region
+                        FROM wms.stock_movement_by_location
+                        WHERE location_id = $1
+                        LIMIT 1
+                    ),
+                    ranked_sources AS (
+                        -- Rank sources: same region first, then by excess (highest = most to give)
+                        -- ONLY keep TOP 1 source per SKU to avoid over-allocation
+                        SELECT
+                            n.stock_id,
+                            n.current_balance,
+                            n.outlet_ams,
+                            n.days_of_inventory,
+                            n.order_uom_rate,
+                            n.need_qty,
+                            e.location_id as from_outlet,
+                            e.location_name as from_outlet_name,
+                            e.their_balance,
+                            e.their_doi,
+                            e.excess_qty,
+                            e.velocity_tier,
+                            e.pattern_category,
+                            e.doi_threshold,
+                            e.demand_pattern,
+                            e.ud1_code,
+                            -- Priority: 1=same region, 2=different region
+                            CASE WHEN e.source_region = (SELECT region FROM dest_outlet_region) THEN 1 ELSE 2 END as region_priority,
+                            -- Rank by region first, then by excess quantity (highest = can give most)
+                            ROW_NUMBER() OVER (
+                                PARTITION BY n.stock_id
+                                ORDER BY
+                                    CASE WHEN e.source_region = (SELECT region FROM dest_outlet_region) THEN 0 ELSE 1 END,
+                                    e.excess_qty DESC,
+                                    e.their_doi DESC
+                            ) as source_rank
+                        FROM this_outlet_need n
+                        JOIN filtered_other_excess e ON n.stock_id = e.stock_id
+                        WHERE n.need_qty > 0 AND e.excess_qty > 0
                     )
                     SELECT
-                        n.stock_id,
+                        r.stock_id,
                         COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
                         sms.order_uom,
-                        sms.ud1_code,
-                        sms.demand_pattern,
-                        e.velocity_tier,
-                        e.pattern_category,
-                        e.doi_threshold,
-                        e.location_id as from_outlet,
-                        e.location_name as from_outlet_name,
+                        r.ud1_code,
+                        r.demand_pattern,
+                        r.velocity_tier,
+                        r.pattern_category,
+                        r.doi_threshold,
+                        r.from_outlet,
+                        r.from_outlet_name,
                         $1 as to_outlet,
                         (SELECT location_name FROM wms.stock_movement_by_location WHERE location_id = $1 LIMIT 1) as to_outlet_name,
-                        ROUND(e.their_doi, 0) as from_doi,
-                        ROUND(n.days_of_inventory, 0) as to_doi,
-                        ROUND(e.their_balance / NULLIF(n.order_uom_rate, 0), 0) as from_balance_order_uom,
-                        ROUND(n.current_balance / NULLIF(n.order_uom_rate, 0), 0) as to_balance_order_uom,
+                        ROUND(r.their_doi, 0) as from_doi,
+                        ROUND(r.days_of_inventory, 0) as to_doi,
+                        ROUND(r.their_balance / NULLIF(r.order_uom_rate, 0), 0) as from_balance_order_uom,
+                        ROUND(r.current_balance / NULLIF(r.order_uom_rate, 0), 0) as to_balance_order_uom,
                         -- Transfer qty = MIN(excess, need), in ORDER UOM
-                        ROUND(LEAST(e.excess_qty, n.need_qty) / NULLIF(n.order_uom_rate, 0), 0) as transfer_qty,
-                        ROUND(e.excess_qty / NULLIF(n.order_uom_rate, 0), 0) as excess_qty_order_uom,
-                        ROUND(n.need_qty / NULLIF(n.order_uom_rate, 0), 0) as need_qty_order_uom,
-                        'NEED_FROM_EXCESS' as transfer_reason
-                    FROM this_outlet_need n
-                    JOIN filtered_other_excess e ON n.stock_id = e.stock_id
-                    LEFT JOIN wms.stock_movement_summary sms ON n.stock_id = sms.stock_id
-                    WHERE n.need_qty > 0 AND e.excess_qty > 0
-                    ORDER BY LEAST(e.excess_qty, n.need_qty) DESC, (e.their_doi - n.days_of_inventory) DESC
+                        ROUND(LEAST(r.excess_qty, r.need_qty) / NULLIF(r.order_uom_rate, 0), 0) as transfer_qty,
+                        ROUND(r.excess_qty / NULLIF(r.order_uom_rate, 0), 0) as excess_qty_order_uom,
+                        ROUND(r.need_qty / NULLIF(r.order_uom_rate, 0), 0) as need_qty_order_uom,
+                        CASE WHEN r.region_priority = 1 THEN 'SAME_REGION' ELSE 'OTHER_REGION' END as transfer_reason
+                    FROM ranked_sources r
+                    LEFT JOIN wms.stock_movement_summary sms ON r.stock_id = sms.stock_id
+                    WHERE r.source_rank = 1  -- Only the BEST source per SKU
+                    ORDER BY r.need_qty DESC, r.excess_qty DESC
                     LIMIT $2
                 """
                 in_rows = await conn.fetch(in_query, outlet_id, limit)
