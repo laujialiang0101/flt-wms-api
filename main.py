@@ -4553,9 +4553,11 @@ async def get_outlet_sku_intelligence(
                         d.outlet_trend_index,
                         d.outlet_demand_pattern,
                         d.outlet_abc_class,
+                        sms.gp_abc_class,
                         d.last_updated,
                         COALESCE(d.is_active, true) as is_active
                     FROM wms.outlet_sku_data d
+                    LEFT JOIN wms.stock_movement_summary sms ON d.stock_id = sms.stock_id
                     WHERE {where_clause}
                     {order_clause}
                     {limit_clause}
