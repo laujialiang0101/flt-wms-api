@@ -5120,6 +5120,7 @@ async def get_stock_rotation_recommendations(
                             sml.stock_id,
                             sml.current_balance,
                             sml.outlet_ams,
+                            sml.outlet_ams as ams_calculated,
                             sml.days_of_inventory,
                             COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1) as order_uom_rate,
                             COALESCE(sms.demand_pattern, 'STABLE') as demand_pattern,
