@@ -5082,8 +5082,8 @@ async def get_smart_product_suggestions(
             # World-class product suggestion query
             query = f"""
                 WITH target_outlet_products AS (
-                    -- Products already at target outlet
-                    SELECT stock_id, outlet_ams, total_12m
+                    -- Products already at target outlet (ANY record = product exists)
+                    SELECT stock_id, outlet_ams, total_12m, current_balance
                     FROM wms.stock_movement_by_location
                     WHERE location_id = $1
                 ),
@@ -5216,7 +5216,7 @@ async def get_smart_product_suggestions(
                     LEFT JOIN target_outlet_products top ON oop.stock_id = top.stock_id
                     LEFT JOIN target_category_coverage tcc ON sms.ud1_code = tcc.ud1_code
                     LEFT JOIN regional_category_avg rca ON sms.ud1_code = rca.ud1_code
-                    WHERE (top.outlet_ams IS NULL OR top.outlet_ams = 0)  -- NOT selling at target
+                    WHERE top.stock_id IS NULL  -- Product does NOT exist at target outlet
                     AND sms.is_active = true  -- Only active products
                     {category_filter}
                 )
