@@ -5314,6 +5314,7 @@ async def get_smart_product_suggestions(
                     "categories_represented": len(set(s['ud1_code'] for s in suggestions if s['ud1_code']))
                 }
             }
+            return result
     except HTTPException:
         raise
     except Exception as e:
@@ -6340,6 +6341,7 @@ async def get_stock_rebalancing(
                     "total_rebalancing_opportunities": len(donate_to_others) + len(receive_from_others)
                 }
             }
+            return result
     except HTTPException:
         raise
     except Exception as e:
