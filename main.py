@@ -4436,8 +4436,8 @@ async def get_outlet_sku_intelligence(
                 """)
 
                 # Determine if we can use instant pagination (no filters + row_num exists)
-                # Note: is_active='Y' is default, so only count as filter if it's N or empty (all)
-                has_filters = bool(reorder_recommendation or _uncertain_filter or ud1_code or search or (is_active and is_active != 'Y'))
+                # Note: ANY is_active filter means we need dynamic counts (pre-computed summary has all items)
+                has_filters = bool(reorder_recommendation or _uncertain_filter or ud1_code or search or is_active)
 
                 # Build WHERE clause
                 conditions = ["d.location_id = $1"]
@@ -4563,36 +4563,72 @@ async def get_outlet_sku_intelligence(
 
                 rows = await conn.fetch(query, *params)
 
-                # Get summary from fast summary table
-                summary_row = await conn.fetchrow("""
-                    SELECT total_skus, stockout_count, order_now_count, order_soon_count,
-                           optimal_count, overstocked_count, review_count
-                    FROM wms.outlet_sku_summary
-                    WHERE location_id = $1
-                """, outlet_id)
+                # Get summary - use dynamic counts when is_active filter is applied
+                # (pre-computed summary table has all items, not filtered by is_active)
+                if is_active:
+                    # Compute summary dynamically with is_active filter
+                    active_condition = "d.is_active = true" if is_active == 'Y' else "d.is_active = false"
+                    summary_rows = await conn.fetch(f"""
+                        SELECT
+                            COALESCE(d.reorder_recommendation, 'REVIEW') as rec,
+                            COUNT(*) as cnt
+                        FROM wms.outlet_sku_data d
+                        WHERE d.location_id = $1 AND {active_condition}
+                        GROUP BY COALESCE(d.reorder_recommendation, 'REVIEW')
+                    """, outlet_id)
 
-                if summary_row:
-                    summary = {
-                        'STOCKOUT': summary_row['stockout_count'],
-                        'ORDER_NOW': summary_row['order_now_count'],
-                        'ORDER_SOON': summary_row['order_soon_count'],
-                        'OPTIMAL': summary_row['optimal_count'],
-                        'OVERSTOCKED': summary_row['overstocked_count'],
-                        'UNCERTAIN': summary_row['review_count']
-                    }
-                    if not has_filters:
-                        # Use pre-computed total from summary table
-                        total = summary_row['total_skus']
-                    else:
-                        # Count with filters (excludes row_num condition)
-                        total = await conn.fetchval(f"""
-                            SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {count_where_clause}
-                        """, *count_params)
-                else:
-                    summary = {}
+                    summary = {'STOCKOUT': 0, 'ORDER_NOW': 0, 'ORDER_SOON': 0, 'OPTIMAL': 0, 'OVERSTOCKED': 0, 'DELIST': 0, 'UNCERTAIN': 0}
+                    for row in summary_rows:
+                        rec = row['rec']
+                        cnt = row['cnt']
+                        if rec == 'STOCKOUT':
+                            summary['STOCKOUT'] = cnt
+                        elif rec == 'ORDER_NOW':
+                            summary['ORDER_NOW'] = cnt
+                        elif rec == 'ORDER_SOON':
+                            summary['ORDER_SOON'] = cnt
+                        elif rec == 'OPTIMAL':
+                            summary['OPTIMAL'] = cnt
+                        elif rec in ('REDUCE_ORDER', 'STOP_ORDERING'):
+                            summary['OVERSTOCKED'] = summary.get('OVERSTOCKED', 0) + cnt
+                        elif rec == 'DELIST_CANDIDATE':
+                            summary['DELIST'] = summary.get('DELIST', 0) + cnt
+                        elif rec in ('REVIEW', 'UNKNOWN'):
+                            summary['UNCERTAIN'] = summary.get('UNCERTAIN', 0) + cnt
+
+                    # Get total with current filters
                     total = await conn.fetchval(f"""
                         SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {count_where_clause}
                     """, *count_params)
+                else:
+                    # Use pre-computed summary (no is_active filter - show all)
+                    summary_row = await conn.fetchrow("""
+                        SELECT total_skus, stockout_count, order_now_count, order_soon_count,
+                               optimal_count, overstocked_count, review_count
+                        FROM wms.outlet_sku_summary
+                        WHERE location_id = $1
+                    """, outlet_id)
+
+                    if summary_row:
+                        summary = {
+                            'STOCKOUT': summary_row['stockout_count'],
+                            'ORDER_NOW': summary_row['order_now_count'],
+                            'ORDER_SOON': summary_row['order_soon_count'],
+                            'OPTIMAL': summary_row['optimal_count'],
+                            'OVERSTOCKED': summary_row['overstocked_count'],
+                            'UNCERTAIN': summary_row['review_count']
+                        }
+                        if not has_filters:
+                            total = summary_row['total_skus']
+                        else:
+                            total = await conn.fetchval(f"""
+                                SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {count_where_clause}
+                            """, *count_params)
+                    else:
+                        summary = {}
+                        total = await conn.fetchval(f"""
+                            SELECT COUNT(*) FROM wms.outlet_sku_data d WHERE {count_where_clause}
+                        """, *count_params)
 
                 # Get review_summary from master SKU data for items in this outlet
                 review_summary_rows = await conn.fetch("""
