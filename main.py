@@ -5519,6 +5519,298 @@ async def get_stock_rotation_recommendations(
 
 
 # ========================================
+# Stock Rebalancing API
+# ========================================
+
+
+@app.get("/api/v1/analytics/stock-rebalancing")
+async def get_stock_rebalancing(
+    api_key: str = Query(...),
+    outlet_id: str = Query(..., description="Target outlet ID"),
+    staff_id: str = Query(..., description="Staff ID for access control"),
+    max_company_doi: int = Query(default=30, description="Max company-wide DOI to consider (supply-constrained items)"),
+    min_doi_variance: int = Query(default=7, description="Minimum DOI difference from average to trigger rebalancing"),
+    limit: int = Query(default=100, le=500)
+):
+    """Get stock rebalancing recommendations for supply-constrained items.
+
+    Purpose: When company-wide inventory is LOW (supply chain issues) but unevenly
+    distributed across outlets, recommend transfers to balance distribution.
+
+    Logic:
+    1. Find SKUs where company-wide DOI < max_company_doi (supply-constrained)
+    2. Calculate average DOI across all outlets for each SKU
+    3. Identify DONORS: outlets with DOI > average + min_doi_variance
+    4. Identify RECIPIENTS: outlets with DOI < average - min_doi_variance
+    5. Recommend transfers to balance
+
+    Example:
+    - SKU "ABC123": Company DOI = 14 days, Average outlet DOI = 13 days
+    - Outlet A: 30 days → DONOR (excess of 17 days above avg)
+    - Outlet B: 2 days → RECIPIENT (11 days below avg)
+    - Transfer from A → B to balance
+    """
+    verify_api_key(api_key)
+
+    try:
+        async with pool.acquire() as conn:
+            # Verify user access (same as stock rotation)
+            staff = await conn.fetchrow("""
+                SELECT role, region, allowed_outlets, pos_user_group
+                FROM kpi.staff_list_master
+                WHERE UPPER(staff_id) = UPPER($1) AND is_active = true
+            """, staff_id)
+
+            if not staff:
+                raise HTTPException(status_code=404, detail="Staff not found")
+
+            role = (staff['role'] or '').lower()
+            pos_group = (staff['pos_user_group'] or '').upper().strip()
+
+            has_access = (
+                role in ('admin', 'coo', 'cmo', 'director', 'area_manager') or
+                pos_group in ('ADMINISTRATORS', 'COO', 'CMO', 'CEO', 'PURCHASER', 'WAREHOUSE MANAGER', 'AREA MANAGER')
+            )
+
+            if not has_access:
+                return {
+                    "status": "success",
+                    "outlet_id": outlet_id,
+                    "message": "Stock rebalancing requires manager access",
+                    "donate_to_others": [],
+                    "receive_from_others": [],
+                    "summary": {"total_donate": 0, "total_receive": 0}
+                }
+
+            donate_to_others = []
+            receive_from_others = []
+
+            # ============================================================
+            # REBALANCING QUERY
+            # Find supply-constrained SKUs with uneven distribution
+            # ============================================================
+            query = """
+                WITH company_totals AS (
+                    -- Calculate company-wide metrics for each SKU
+                    SELECT
+                        sml.stock_id,
+                        SUM(sml.current_balance) as total_balance,
+                        SUM(sml.outlet_ams) as total_ams,
+                        CASE
+                            WHEN SUM(sml.outlet_ams) > 0 THEN
+                                SUM(sml.current_balance) / (SUM(sml.outlet_ams) / 30.0)
+                            ELSE 9999
+                        END as company_doi,
+                        COUNT(DISTINCT sml.location_id) as outlet_count
+                    FROM wms.stock_movement_by_location sml
+                    WHERE sml.current_balance > 0 OR sml.outlet_ams > 0
+                    GROUP BY sml.stock_id
+                    HAVING SUM(sml.outlet_ams) > 0  -- Must have some sales
+                ),
+                supply_constrained AS (
+                    -- Filter to supply-constrained items (company DOI < threshold)
+                    SELECT * FROM company_totals
+                    WHERE company_doi < $1  -- max_company_doi parameter
+                    AND outlet_count >= 2   -- Must be in multiple outlets
+                ),
+                outlet_distribution AS (
+                    -- Get DOI for each outlet-SKU combination
+                    SELECT
+                        sml.stock_id,
+                        sml.location_id,
+                        sml.location_name,
+                        sml.current_balance,
+                        sml.outlet_ams,
+                        sml.days_of_inventory,
+                        COALESCE(sml.order_uom_rate, sms.order_uom_rate, 1) as order_uom_rate,
+                        sc.company_doi,
+                        sc.total_balance,
+                        sc.total_ams,
+                        sc.outlet_count
+                    FROM wms.stock_movement_by_location sml
+                    JOIN supply_constrained sc ON sml.stock_id = sc.stock_id
+                    LEFT JOIN wms.stock_movement_summary sms ON sml.stock_id = sms.stock_id
+                    WHERE sml.current_balance > 0 OR sml.outlet_ams > 0
+                ),
+                sku_averages AS (
+                    -- Calculate average DOI per SKU (across outlets with stock/sales)
+                    SELECT
+                        stock_id,
+                        AVG(days_of_inventory) as avg_doi,
+                        STDDEV(days_of_inventory) as stddev_doi
+                    FROM outlet_distribution
+                    WHERE days_of_inventory IS NOT NULL AND days_of_inventory < 9999
+                    GROUP BY stock_id
+                ),
+                classified AS (
+                    -- Classify each outlet-SKU as DONOR, RECIPIENT, or BALANCED
+                    SELECT
+                        od.*,
+                        sa.avg_doi,
+                        sa.stddev_doi,
+                        od.days_of_inventory - sa.avg_doi as doi_variance,
+                        CASE
+                            WHEN od.days_of_inventory > sa.avg_doi + $2 THEN 'DONOR'
+                            WHEN od.days_of_inventory < sa.avg_doi - $2 THEN 'RECIPIENT'
+                            ELSE 'BALANCED'
+                        END as classification,
+                        -- Calculate transferable qty (in base UOM)
+                        CASE
+                            WHEN od.days_of_inventory > sa.avg_doi + $2 THEN
+                                -- Donor can give: excess above (avg + buffer) in days worth of stock
+                                GREATEST(0, od.current_balance - (od.outlet_ams / 30.0 * (sa.avg_doi + $2)))
+                            ELSE 0
+                        END as can_donate_qty,
+                        CASE
+                            WHEN od.days_of_inventory < sa.avg_doi - $2 THEN
+                                -- Recipient needs: shortage below (avg - buffer) in days worth of stock
+                                GREATEST(0, (od.outlet_ams / 30.0 * (sa.avg_doi - $2)) - od.current_balance)
+                            ELSE 0
+                        END as need_qty
+                    FROM outlet_distribution od
+                    JOIN sku_averages sa ON od.stock_id = sa.stock_id
+                ),
+                donors AS (
+                    SELECT * FROM classified WHERE classification = 'DONOR' AND can_donate_qty > 0
+                ),
+                recipients AS (
+                    SELECT * FROM classified WHERE classification = 'RECIPIENT' AND need_qty > 0
+                ),
+                -- DONATE TO OTHERS: This outlet is a DONOR, find recipients
+                donate_matches AS (
+                    SELECT
+                        d.stock_id,
+                        d.location_id as from_outlet,
+                        d.location_name as from_outlet_name,
+                        d.days_of_inventory as from_doi,
+                        d.current_balance as from_balance,
+                        d.can_donate_qty,
+                        d.avg_doi,
+                        d.company_doi,
+                        d.order_uom_rate,
+                        r.location_id as to_outlet,
+                        r.location_name as to_outlet_name,
+                        r.days_of_inventory as to_doi,
+                        r.current_balance as to_balance,
+                        r.need_qty,
+                        LEAST(d.can_donate_qty, r.need_qty) as transfer_qty
+                    FROM donors d
+                    JOIN recipients r ON d.stock_id = r.stock_id AND d.location_id != r.location_id
+                    WHERE d.location_id = $3  -- This outlet is donor
+                ),
+                -- RECEIVE FROM OTHERS: This outlet is a RECIPIENT, find donors
+                receive_matches AS (
+                    SELECT
+                        r.stock_id,
+                        d.location_id as from_outlet,
+                        d.location_name as from_outlet_name,
+                        d.days_of_inventory as from_doi,
+                        d.current_balance as from_balance,
+                        d.can_donate_qty,
+                        r.avg_doi,
+                        r.company_doi,
+                        r.order_uom_rate,
+                        r.location_id as to_outlet,
+                        r.location_name as to_outlet_name,
+                        r.days_of_inventory as to_doi,
+                        r.current_balance as to_balance,
+                        r.need_qty,
+                        LEAST(d.can_donate_qty, r.need_qty) as transfer_qty
+                    FROM recipients r
+                    JOIN donors d ON r.stock_id = d.stock_id AND r.location_id != d.location_id
+                    WHERE r.location_id = $3  -- This outlet is recipient
+                )
+                SELECT
+                    'DONATE' as direction,
+                    m.stock_id,
+                    COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
+                    sms.order_uom,
+                    sms.ud1_code,
+                    sms.demand_pattern,
+                    m.from_outlet,
+                    m.from_outlet_name,
+                    m.to_outlet,
+                    m.to_outlet_name,
+                    ROUND(m.from_doi, 0) as from_doi,
+                    ROUND(m.to_doi, 0) as to_doi,
+                    ROUND(m.avg_doi, 0) as avg_doi,
+                    ROUND(m.company_doi, 0) as company_doi,
+                    ROUND(m.from_balance / NULLIF(m.order_uom_rate, 0), 0) as from_balance_order_uom,
+                    ROUND(m.to_balance / NULLIF(m.order_uom_rate, 0), 0) as to_balance_order_uom,
+                    ROUND(m.transfer_qty / NULLIF(m.order_uom_rate, 0), 0) as transfer_qty,
+                    'REBALANCE' as transfer_reason
+                FROM donate_matches m
+                LEFT JOIN wms.stock_movement_summary sms ON m.stock_id = sms.stock_id
+                WHERE m.transfer_qty > 0
+
+                UNION ALL
+
+                SELECT
+                    'RECEIVE' as direction,
+                    m.stock_id,
+                    COALESCE(sms.order_uom_stock_name, sms.stock_name) as stock_name,
+                    sms.order_uom,
+                    sms.ud1_code,
+                    sms.demand_pattern,
+                    m.from_outlet,
+                    m.from_outlet_name,
+                    m.to_outlet,
+                    m.to_outlet_name,
+                    ROUND(m.from_doi, 0) as from_doi,
+                    ROUND(m.to_doi, 0) as to_doi,
+                    ROUND(m.avg_doi, 0) as avg_doi,
+                    ROUND(m.company_doi, 0) as company_doi,
+                    ROUND(m.from_balance / NULLIF(m.order_uom_rate, 0), 0) as from_balance_order_uom,
+                    ROUND(m.to_balance / NULLIF(m.order_uom_rate, 0), 0) as to_balance_order_uom,
+                    ROUND(m.transfer_qty / NULLIF(m.order_uom_rate, 0), 0) as transfer_qty,
+                    'REBALANCE' as transfer_reason
+                FROM receive_matches m
+                LEFT JOIN wms.stock_movement_summary sms ON m.stock_id = sms.stock_id
+                WHERE m.transfer_qty > 0
+
+                ORDER BY transfer_qty DESC
+                LIMIT $4
+            """
+
+            rows = await conn.fetch(query, max_company_doi, min_doi_variance, outlet_id, limit)
+
+            for row in rows:
+                row_dict = dict(row)
+                if row_dict['direction'] == 'DONATE':
+                    donate_to_others.append(row_dict)
+                else:
+                    receive_from_others.append(row_dict)
+
+            # Get outlet name
+            outlet_name_row = await conn.fetchrow("""
+                SELECT DISTINCT location_name FROM wms.stock_movement_by_location
+                WHERE location_id = $1 LIMIT 1
+            """, outlet_id)
+            outlet_name = outlet_name_row['location_name'] if outlet_name_row else outlet_id
+
+            return {
+                "status": "success",
+                "outlet_id": outlet_id,
+                "outlet_name": outlet_name,
+                "parameters": {
+                    "max_company_doi": max_company_doi,
+                    "min_doi_variance": min_doi_variance
+                },
+                "donate_to_others": donate_to_others,
+                "receive_from_others": receive_from_others,
+                "summary": {
+                    "total_donate": len(donate_to_others),
+                    "total_receive": len(receive_from_others),
+                    "total_rebalancing_opportunities": len(donate_to_others) + len(receive_from_others)
+                }
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ========================================
 # Purchase Orders API
 # ========================================
 
