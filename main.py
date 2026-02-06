@@ -4977,7 +4977,7 @@ async def get_smart_product_suggestions(
     staff_id: str = Query(..., description="Staff ID for access control"),
     category: Optional[str] = Query(default=None, description="Filter by category (ud1_code)"),
     min_confidence: int = Query(default=50, description="Minimum confidence score (0-100)"),
-    limit: int = Query(default=500, le=2000)
+    limit: int = Query(default=500, le=10000)
 ):
     """World-Class Product Suggester - Learn from REAL historical data to suggest new products.
 
@@ -5469,7 +5469,7 @@ async def get_stock_rotation_recommendations(
     outlet_id: str = Query(..., description="Target outlet ID (view transfers TO/FROM this outlet)"),
     staff_id: str = Query(..., description="Staff ID to determine access level"),
     direction: str = Query(default="both", description="'in' = transfers INTO outlet, 'out' = transfers OUT, 'both' = all"),
-    limit: int = Query(default=500, le=2000)
+    limit: int = Query(default=500, le=10000)
 ):
     """Get stock rotation recommendations - match overstocked outlets with understocked outlets.
 
@@ -6041,7 +6041,7 @@ async def get_stock_rebalancing(
     api_key: str = Query(...),
     outlet_id: str = Query(..., description="Target outlet ID"),
     staff_id: str = Query(..., description="Staff ID for access control"),
-    limit: int = Query(default=500, le=2000)
+    limit: int = Query(default=500, le=10000)
 ):
     """World-Class Stock Rebalancing using Fair Share + Service Level + Priority Scoring.
 
