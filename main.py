@@ -5080,12 +5080,16 @@ async def get_smart_product_suggestions(
                 param_idx += 1
 
             # World-class product suggestion query
+            # FIX: Changed logic from "products not in outlet" to "products with low/zero sales at outlet"
+            # because stock_movement_by_location contains records for ALL products at ALL outlets
             query = f"""
                 WITH target_outlet_products AS (
-                    -- Products already at target outlet (ANY record = product exists)
+                    -- Products with ACTIVE sales at target outlet (outlet_ams >= 1)
+                    -- Products below this threshold are considered "missing" or "underperforming"
                     SELECT stock_id, outlet_ams, total_12m, current_balance
                     FROM wms.stock_movement_by_location
                     WHERE location_id = $1
+                    AND outlet_ams >= 1  -- Only count as "has product" if meaningful sales
                 ),
                 target_category_coverage AS (
                     -- Category coverage at target outlet
@@ -5118,25 +5122,24 @@ async def get_smart_product_suggestions(
                 ),
                 other_outlet_performance AS (
                     -- Products performing well in OTHER outlets (not target)
-                    -- NOTE: outlet_ams already uses weighted methodology with seasonality factored in
+                    -- Must have AMS >= 3 to be considered a good performer
                     SELECT
                         sml.stock_id,
                         COUNT(DISTINCT sml.location_id) as selling_outlet_count,
                         ARRAY_AGG(DISTINCT sml.location_id) as selling_outlets,
                         ARRAY_AGG(DISTINCT sml.location_name) as selling_outlet_names,
-                        AVG(sml.outlet_ams) as avg_ams,  -- Already seasonality-adjusted
+                        AVG(sml.outlet_ams) as avg_ams,
                         MAX(sml.outlet_ams) as max_ams,
                         SUM(sml.total_12m) as total_regional_sales,
-                        -- Demand pattern and momentum already capture growth/seasonality trends
                         MODE() WITHIN GROUP (ORDER BY sml.outlet_demand_pattern) as dominant_pattern,
                         MODE() WITHIN GROUP (ORDER BY sml.outlet_momentum_status) as dominant_momentum,
                         AVG(sml.outlet_trend_index) as avg_trend_index
                     FROM wms.stock_movement_by_location sml
                     WHERE sml.location_id != $1
                     AND sml.location_id NOT IN ('WAREHOUSE', 'QUARANTINE', 'RETURN', 'S-ISCS')
-                    AND sml.outlet_ams > 0  -- Only products with actual sales
+                    AND sml.outlet_ams >= 3  -- Only products with good sales (at least 3/month)
                     GROUP BY sml.stock_id
-                    HAVING COUNT(DISTINCT sml.location_id) >= 2  -- At least 2 outlets selling
+                    HAVING COUNT(DISTINCT sml.location_id) >= 2  -- At least 2 outlets selling with good sales
                 ),
                 scored_products AS (
                     SELECT
@@ -5216,8 +5219,9 @@ async def get_smart_product_suggestions(
                     LEFT JOIN target_outlet_products top ON oop.stock_id = top.stock_id
                     LEFT JOIN target_category_coverage tcc ON sms.ud1_code = tcc.ud1_code
                     LEFT JOIN regional_category_avg rca ON sms.ud1_code = rca.ud1_code
-                    WHERE top.stock_id IS NULL  -- Product does NOT exist at target outlet
+                    WHERE top.stock_id IS NULL  -- Product has low/zero sales at target (AMS < 1)
                     AND sms.is_active = true  -- Only active products
+                    AND oop.avg_ams >= 3  -- Must have good average sales across outlets
                     {category_filter}
                 )
                 SELECT
